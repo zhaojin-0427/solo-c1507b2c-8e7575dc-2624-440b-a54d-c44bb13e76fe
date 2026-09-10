@@ -652,13 +652,15 @@ function renderPlans(plans) {
     return;
   }
   el.innerHTML = plans.map((p, i) => {
+    const deltaCell = (v) => v === 0 ? '<span class="muted">—</span>'
+      : `<span class="${v > 0 ? 'delta-pos' : 'delta-neg'}">${v > 0 ? '+' : '−'}${esc(fmtDur(Math.abs(v)))}</span>`;
     const moves = p.moves.length ? `<table>
-      <thead><tr><th>事件</th><th>原开始</th><th>新开始</th><th>移动量</th></tr></thead>
+      <thead><tr><th>事件</th><th>新开始</th><th>开始移动</th><th>结束移动</th></tr></thead>
       <tbody>${p.moves.map((m) => `<tr>
         <td>${esc(m.title)}</td>
-        <td>${esc(fmtTs(m.from_start, S.displayTz))}</td>
         <td>${esc(fmtTs(m.to_start, S.displayTz))}</td>
-        <td class="${m.delta_ms >= 0 ? 'delta-pos' : 'delta-neg'}">${m.delta_ms >= 0 ? '+' : '−'}${esc(fmtDur(Math.abs(m.delta_ms)))}</td>
+        <td>${deltaCell(m.delta_start_ms ?? m.delta_ms ?? 0)}</td>
+        <td>${deltaCell(m.delta_end_ms ?? 0)}</td>
       </tr>`).join('')}</tbody></table>` : '<p class="muted">无需移动任何事件。</p>';
     const un = p.unresolved.length
       ? `<div class="unresolved">仍未解决 ${p.unresolved.length} 项:<ul>${p.unresolved.map((u) => `<li>${esc(u.title)}</li>`).join('')}</ul></div>`

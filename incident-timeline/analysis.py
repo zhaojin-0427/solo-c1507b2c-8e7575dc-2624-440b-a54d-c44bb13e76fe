@@ -6,6 +6,7 @@
 
 所有时间均为 UTC 毫秒。事件 end_ts 为 None 表示瞬时事件。
 """
+import heapq
 from collections import defaultdict, deque
 
 from timeutil import fmt_ms
@@ -329,10 +330,14 @@ def detect(events, deps, excls):
             continue
         ov = min(ev_end(a), ev_end(b)) - max(a['start_ts'], b['start_ts'])
         if ov > 0:
-            if a['start_ts'] <= b['start_ts']:
-                fixes = [[(a['id'], -ov, -ov)], [(b['id'], ov, ov)]]
-            else:
-                fixes = [[(b['id'], -ov, -ov)], [(a['id'], ov, ov)]]
+            # 分离位移须按端点距离计算: 一个事件包含另一个时,
+            # 仅移动重叠量 ov 无法将两者分开
+            shift_ab = ev_end(a) - b['start_ts']   # 让 A 整体移到 B 之前
+            shift_ba = ev_end(b) - a['start_ts']   # 让 B 整体移到 A 之前
+            fixes = [[(a['id'], -shift_ab, -shift_ab)],
+                     [(b['id'], shift_ab, shift_ab)],
+                     [(b['id'], -shift_ba, -shift_ba)],
+                     [(a['id'], shift_ba, shift_ba)]]
             add(type='overlap',
                 title=f'互斥状态重叠:「{a["title"]}」与「{b["title"]}」',
                 detail=(f'两者被标记为互斥({x.get("reason") or "未填写原因"}),'
@@ -403,63 +408,189 @@ def analyze(events, deps, excls):
 
 
 # ---------------------------------------------------------------- 最小调整方案
+#
+# 移动量度量: 每个事件的移动量 = max(|开始位移|, |结束位移|),
+# 方案总移动量 = 各事件移动量之和。瞬时事件(end_ts=None)结束位移视为 0。
+# 修复动作表示为 [(事件id, 开始位移, 结束位移), ...]。
 
-def _choose_fix(options, strategy, sim):
-    """从一条冲突的可行修复动作中按策略选一个。动作: [(事件id, 开始位移, 结束位移)]"""
-    valid = [o for o in options
-             if o and all(not sim[eid].get('locked') for eid, _ds, _de in o)]
-    if not valid:
+def _apply_op(sim, op):
+    for eid, ds, de in op:
+        ev = sim[eid]
+        ev['start_ts'] += ds
+        if ev['end_ts'] is not None:
+            ev['end_ts'] += de
+
+
+def _op_cost(op):
+    """单个修复动作的代价, 与方案移动量度量一致。"""
+    return sum(max(abs(ds), abs(de)) for _, ds, de in op)
+
+
+def _plan_from_sim(events, sim, initial, remaining):
+    """由最终状态生成方案: 按起止端点的实际变化计算每个事件的移动量。"""
+    moves = []
+    total = 0
+    for e in events:
+        s = sim[e['id']]
+        orig_end = e['end_ts'] if e['end_ts'] is not None else e['start_ts']
+        new_end = s['end_ts'] if s['end_ts'] is not None else s['start_ts']
+        ds = s['start_ts'] - e['start_ts']
+        de = new_end - orig_end
+        if ds == 0 and de == 0:
+            continue
+        mv = max(abs(ds), abs(de))
+        total += mv
+        moves.append({'event_id': e['id'], 'title': e['title'],
+                      'from_start': e['start_ts'], 'from_end': e['end_ts'],
+                      'to_start': s['start_ts'], 'to_end': s['end_ts'],
+                      'delta_start_ms': ds, 'delta_end_ms': de,
+                      # 兼容字段: 单一代表位移(优先开始端, 开始不变时取结束端)
+                      'delta_ms': ds if ds != 0 else de,
+                      'move_ms': mv})
+    return {'moves': moves,
+            'total_shift_ms': total,
+            'resolved': len(initial) - len(remaining),
+            'unresolved': [public_conflict(c) for c in remaining]}
+
+
+def _ckey(c):
+    """冲突身份: 同一冲突在迭代中保持稳定(用于失败尝试计数与放弃标记)。"""
+    return (c['type'],
+            tuple(sorted(c.get('dep_ids') or [])),
+            tuple(sorted(c.get('event_ids') or [])))
+
+
+def _fix_budget(c):
+    """同一冲突沿单条路径允许的最大修复尝试次数。
+
+    正常冲突一次修复即解; 时钟偏移组可能每条边修一次;
+    预算需覆盖该冲突的修复选项数, 同时阻止不可能约束的无限振荡。
+    """
+    return max(2, len(c.get('dep_ids') or []), len(c.get('fixes') or []))
+
+
+def _op_sig(op):
+    return tuple(sorted(op))
+
+
+def _workable(confs, sim, excluded=()):
+    """[(key, conflict, [有效修复选项])]: 未排除、未锁定、有可行修复的冲突。"""
+    out = []
+    for c in confs:
+        key = _ckey(c)
+        if key in excluded:
+            continue
+        valid = [o for o in c.get('fixes', [])
+                 if o and all(not sim[eid].get('locked') for eid, _, _ in o)]
+        if valid:
+            out.append((key, c, valid))
+    return out
+
+
+def _choose_fix(options, strategy, tried=()):
+    """贪心策略: 从有效修复动作中选一个(避开本冲突已尝试过的)。"""
+    avail = [o for o in options if _op_sig(o) not in tried]
+    if not avail:
         return None
 
     def net(o):
         return sum(ds + de for _, ds, de in o)
 
-    def cost(o):
-        return sum(abs(ds) + abs(de) for _, ds, de in o)
-
     if strategy == 'push_later':
-        return min(valid, key=lambda o: (net(o) < 0, cost(o)))
+        return min(avail, key=lambda o: (net(o) < 0, _op_cost(o)))
     if strategy == 'pull_earlier':
-        return min(valid, key=lambda o: (net(o) > 0, cost(o)))
-    return min(valid, key=cost)
+        return min(avail, key=lambda o: (net(o) > 0, _op_cost(o)))
+    return min(avail, key=_op_cost)
 
 
-def _solve(events, deps, excls, strategy, max_iter=120):
+def _greedy(events, deps, excls, strategy, excluded=frozenset(), max_iter=200):
+    """贪心迭代求解, 返回 (方案, 被判定不可解的冲突键集合)。
+
+    同一冲突的每个修复选项只尝试一次: 全部试过却仍然存在的冲突
+    (典型如因果环上互相矛盾的前置约束)判定为不可解——继续修只会
+    让事件位移在振荡中无限增大。
+    """
     sim = {e['id']: dict(e) for e in events}
-    before = detect(list(sim.values()), deps, excls)
-    seen_states = {_state_sig(sim)}
+    initial = detect(list(sim.values()), deps, excls)
+    tried = defaultdict(set)
+    confs = initial
     for _ in range(max_iter):
-        confs = detect(list(sim.values()), deps, excls)
-        op = None
-        for c in confs:
-            if c.get('fixes'):
-                op = _choose_fix(c['fixes'], strategy, sim)
-                if op:
-                    break
+        op = chosen = None
+        for key, c, valid in _workable(confs, sim, excluded):
+            op = _choose_fix(valid, strategy, tried[key])
+            if op:
+                chosen = key
+                break
         if not op:
             break
-        for eid, ds, de in op:
-            ev = sim[eid]
-            ev['start_ts'] += ds
-            if ev['end_ts'] is not None:
-                ev['end_ts'] += de
-        sig = _state_sig(sim)
-        if sig in seen_states:      # 进入振荡, 停止
+        tried[chosen].add(_op_sig(op))
+        _apply_op(sim, op)
+        confs = detect(list(sim.values()), deps, excls)
+    exhausted = set()
+    for key, c, valid in _workable(confs, sim, excluded):
+        if all(_op_sig(o) in tried[key] for o in valid):
+            exhausted.add(key)
+    return _plan_from_sim(events, sim, initial, confs), exhausted
+
+
+def _solve(events, deps, excls, strategy):
+    """两阶段贪心: 先探测出不可解冲突并排除, 再求解得到干净的方案。"""
+    probe, exhausted = _greedy(events, deps, excls, strategy)
+    if not exhausted:
+        return probe
+    plan, _ = _greedy(events, deps, excls, strategy, excluded=exhausted)
+    return plan
+
+
+def _solve_optimal(events, deps, excls, max_expand=5000):
+    """min_total: 排除不可解冲突后, 在状态空间上 Dijkstra 搜索最小总移动量。
+
+    先用贪心探测识别不可解冲突(所有修复选项都试过仍存在的),
+    排除后剩余冲突均可解; 此时目标状态 = 不存在可行修复, 边权 =
+    修复动作代价(非负), 首个出队的目标状态即总移动量最小的方案。
+    同一冲突沿一条路径的修复尝试次数受限, 超出扩展上限回退贪心。
+    锁定事件不参与移动。
+    """
+    _probe, exhausted = _greedy(events, deps, excls, 'min_total')
+    sim0 = {e['id']: dict(e) for e in events}
+    initial = detect(list(sim0.values()), deps, excls)
+    if not _workable(initial, sim0, exhausted):
+        return _plan_from_sim(events, sim0, initial, initial)
+
+    INF = 10 ** 18
+    # 堆元素: (累计移动量, 序号, sim, 各冲突已尝试次数)
+    pq = [(0, 0, sim0, frozenset())]
+    best_known = {}
+    counter = 1
+    best = None
+    expands = 0
+    while pq and expands < max_expand:
+        cost, _, sim, attempts = heapq.heappop(pq)
+        expands += 1
+        att = dict(attempts)
+        confs = detect(list(sim.values()), deps, excls)
+        workable = _workable(confs, sim, exhausted)
+        if not workable:
+            best = (sim, confs)
             break
-        seen_states.add(sig)
-    after = detect(list(sim.values()), deps, excls)
-    moves = []
-    for e in events:
-        s = sim[e['id']]
-        if s['start_ts'] != e['start_ts'] or s['end_ts'] != e['end_ts']:
-            moves.append({'event_id': e['id'], 'title': e['title'],
-                          'from_start': e['start_ts'], 'from_end': e['end_ts'],
-                          'to_start': s['start_ts'], 'to_end': s['end_ts'],
-                          'delta_ms': s['start_ts'] - e['start_ts']})
-    return {'moves': moves,
-            'total_shift_ms': sum(abs(m['delta_ms']) for m in moves),
-            'resolved': len(before) - len(after),
-            'unresolved': [public_conflict(c) for c in after]}
+        for key, c, valid in workable:
+            if att.get(key, 0) >= _fix_budget(c):
+                continue
+            natt = tuple(sorted({**att, key: att.get(key, 0) + 1}.items()))
+            for o in valid:
+                nsim = {i: dict(s) for i, s in sim.items()}
+                _apply_op(nsim, o)
+                ncost = cost + _op_cost(o)
+                sig = (_state_sig(nsim), natt)
+                if best_known.get(sig, INF) <= ncost:
+                    continue
+                best_known[sig] = ncost
+                heapq.heappush(pq, (ncost, counter, nsim, natt))
+                counter += 1
+    if best is None:
+        return _solve(events, deps, excls, 'min_total')   # 超预算, 回退两阶段贪心
+    sim, confs = best
+    return _plan_from_sim(events, sim, initial, confs)
 
 
 def _state_sig(sim):
@@ -471,12 +602,15 @@ def solve_plans(events, deps, excls):
     strategies = [
         ('push_later', '方案 A · 顺延后续事件', '优先把后续事件向后顺延,保持前置事件时间不变'),
         ('pull_earlier', '方案 B · 提前前置事件', '优先把前置事件提前,保持后续事件时间不变'),
-        ('min_total', '方案 C · 最小总移动量', '每一步都选择总移动量最小的可行调整'),
+        ('min_total', '方案 C · 最小总移动量', '搜索总移动量最小的可行方案,不移动锁定事件'),
     ]
     plans = []
     seen = set()
     for key, name, desc in strategies:
-        plan = _solve(events, deps, excls, key)
+        if key == 'min_total':
+            plan = _solve_optimal(events, deps, excls)
+        else:
+            plan = _solve(events, deps, excls, key)
         plan.update(strategy=key, name=name, description=desc)
         sig = tuple(sorted((m['event_id'], m['to_start'], m['to_end'])
                            for m in plan['moves']))

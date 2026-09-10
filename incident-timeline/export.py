@@ -173,6 +173,12 @@ def _evidence_html(evidence):
     return ''.join(rows)
 
 
+def _delta_cell(v):
+    if not v:
+        return '—'
+    return ('+' if v > 0 else '-') + fmt_ms(abs(v))
+
+
 def _plans_html(plans):
     if not plans:
         return ''
@@ -180,11 +186,11 @@ def _plans_html(plans):
     for p in plans:
         rows = ''.join(
             f'<tr><td>{_esc(m["title"])}</td>'
-            f'<td>{_esc(fmt_ts(m["from_start"]))}</td>'
-            f'<td>{_esc(fmt_ts(m["to_start"]))}</td>'
-            f'<td>{_esc(fmt_ms(m["delta_ms"]))}</td></tr>'
+            f'<td>{_esc(fmt_ts(m["from_start"]))} → {_esc(fmt_ts(m["to_start"]))}</td>'
+            f'<td>{_esc(_delta_cell(m.get("delta_start_ms", 0)))}</td>'
+            f'<td>{_esc(_delta_cell(m.get("delta_end_ms", 0)))}</td></tr>'
             for m in p['moves'])
-        moves = (f'<table><thead><tr><th>事件</th><th>原开始</th><th>新开始</th><th>移动量</th></tr></thead>'
+        moves = (f'<table><thead><tr><th>事件</th><th>开始时间变化</th><th>开始移动</th><th>结束移动</th></tr></thead>'
                  f'<tbody>{rows}</tbody></table>' if p['moves'] else '<p>无需移动。</p>')
         un = ''.join(f'<li>{_esc(u["title"])}</li>' for u in p['unresolved'])
         unresolved = f'<p class="warn">仍未解决:</p><ul>{un}</ul>' if un else '<p class="ok">全部冲突可解决。</p>'
