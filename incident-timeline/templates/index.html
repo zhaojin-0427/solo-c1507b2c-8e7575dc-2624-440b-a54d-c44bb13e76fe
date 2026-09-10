@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>事故时序校验台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">⏱</span>
+    <h1>事故时序校验台</h1>
+    <span class="tag">SRE · 复盘主持人</span>
+  </div>
+  <div class="header-actions">
+    <button id="btn-seed" class="btn">载入演示数据</button>
+    <button id="btn-undo" class="btn" disabled>⟲ 撤销</button>
+    <button id="btn-export" class="btn primary">导出复盘 HTML</button>
+    <button id="btn-reset" class="btn danger">清空</button>
+  </div>
+</header>
+
+<div class="layout">
+  <!-- 左栏: 事件录入 -->
+  <aside class="sidebar">
+    <section class="card">
+      <h2 id="form-title">新增事件</h2>
+      <form id="event-form">
+        <label>标题<input name="title" required placeholder="如: 主库 CPU 打满"></label>
+        <div class="row2">
+          <label>开始时间<input name="start" placeholder="2026-09-10 14:03:22"></label>
+          <label>结束时间(可空)<input name="end" placeholder="留空 = 瞬时事件"></label>
+        </div>
+        <div class="row3">
+          <label>时区<input name="timezone" value="UTC" placeholder="UTC / +08:00 / CST"></label>
+          <label>置信度
+            <select name="confidence">
+              <option value="high">高</option>
+              <option value="medium" selected>中</option>
+              <option value="low">低</option>
+            </select>
+          </label>
+          <label>分组<input name="group_name" placeholder="如: 数据库"></label>
+        </div>
+        <div class="row2">
+          <label>来源<input name="source" placeholder="如: slow-query.log"></label>
+          <label>颜色<input name="color" type="color" value="#5b8def"></label>
+        </div>
+        <label>证据引用<textarea name="evidence" rows="2" placeholder="日志原文 / 链接 / 截图说明"></textarea></label>
+        <label class="inline"><input name="locked" type="checkbox"> 锁定(不参与自动调整与拖动)</label>
+        <div class="form-actions">
+          <button type="submit" class="btn primary" id="form-submit">保存事件</button>
+          <button type="button" class="btn" id="form-cancel" hidden>取消编辑</button>
+          <button type="button" class="btn danger" id="form-delete" hidden>删除</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>批量粘贴导入</h2>
+      <p class="hint">每行一条: <code>开始 | 结束(可空) | 置信度(可空) | 标题 | key=value…</code><br>
+      支持 <code>source= evidence= group= tz=</code>;<code>#</code> 开头为注释。</p>
+      <textarea id="bulk-text" rows="5" placeholder="2026-09-10 14:03:22 +08:00 | 2026-09-10 14:05:10 +08:00 | high | 主库 CPU 打满 | source=CloudWatch | group=数据库"></textarea>
+      <div class="row2">
+        <label>默认时区<input id="bulk-tz" value="UTC"></label>
+        <button id="btn-bulk" class="btn">导入</button>
+      </div>
+      <div id="bulk-result"></div>
+    </section>
+
+    <section class="card grow">
+      <h2>事件列表 <span id="event-count" class="muted"></span></h2>
+      <div id="event-list" class="event-list"></div>
+    </section>
+  </aside>
+
+  <!-- 中栏: 时间轴 -->
+  <main class="timeline-pane">
+    <div class="timeline-toolbar">
+      <button class="btn sm" id="zoom-out">−</button>
+      <button class="btn sm" id="zoom-in">＋</button>
+      <button class="btn sm" id="zoom-fit">适应全部</button>
+      <label class="tz-label">显示时区
+        <select id="display-tz">
+          <option value="UTC">UTC</option>
+          <option value="+08:00">UTC+8</option>
+          <option value="+09:00">UTC+9</option>
+          <option value="-05:00">UTC-5</option>
+          <option value="-08:00">UTC-8</option>
+        </select>
+      </label>
+      <span class="hint">滚轮缩放 · 拖动空白平移 · 拖动事件条移动/改时长 · 双击空白在该时刻新建事件</span>
+    </div>
+    <div id="timeline" class="timeline"></div>
+  </main>
+
+  <!-- 右栏: 分析面板 -->
+  <aside class="panel">
+    <nav class="tabs">
+      <button class="tab active" data-tab="conflicts">冲突 <span id="conflict-badge" class="badge-num">0</span></button>
+      <button class="tab" data-tab="plans">调整方案</button>
+      <button class="tab" data-tab="deps">依赖与互斥</button>
+      <button class="tab" data-tab="compare">版本对比</button>
+    </nav>
+
+    <div class="tab-page active" id="tab-conflicts">
+      <div id="conflict-summary" class="muted"></div>
+      <div id="conflict-list"></div>
+    </div>
+
+    <div class="tab-page" id="tab-plans">
+      <p class="hint">在不移动锁定事件的前提下, 生成若干最小调整方案; 每个方案逐项列出移动量与仍未解决的矛盾。</p>
+      <button id="btn-suggest" class="btn primary">生成调整方案</button>
+      <div id="plan-list"></div>
+    </div>
+
+    <div class="tab-page" id="tab-deps">
+      <section class="card flat">
+        <h3>新增依赖</h3>
+        <div class="row2">
+          <label>从<select id="dep-from"></select></label>
+          <label>到<select id="dep-to"></select></label>
+        </div>
+        <div class="row3">
+          <label>类型
+            <select id="dep-type">
+              <option value="before">先于</option>
+              <option value="triggers">触发</option>
+              <option value="during">持续期间</option>
+            </select>
+          </label>
+          <label>最小间隔(秒)<input id="dep-min" type="number" value="0"></label>
+          <label>最大间隔(秒)<input id="dep-max" type="number" placeholder="可空"></label>
+        </div>
+        <label>备注<input id="dep-note" placeholder="可选"></label>
+        <button id="btn-add-dep" class="btn">添加依赖</button>
+      </section>
+      <section class="card flat">
+        <h3>新增互斥状态</h3>
+        <div class="row2">
+          <label>事件 A<select id="excl-a"></select></label>
+          <label>事件 B<select id="excl-b"></select></label>
+        </div>
+        <label>互斥原因<input id="excl-reason" placeholder="如: 主库高负载时不应只读"></label>
+        <button id="btn-add-excl" class="btn">添加互斥</button>
+      </section>
+      <section class="card flat">
+        <h3>已有依赖与互斥</h3>
+        <div id="dep-list"></div>
+      </section>
+    </div>
+
+    <div class="tab-page" id="tab-compare">
+      <p class="hint">与基准版本并排比较。首次变更前的状态自动成为基准。</p>
+      <div class="row2">
+        <button id="btn-compare" class="btn">加载对比</button>
+        <button id="btn-baseline" class="btn">将当前设为基准</button>
+      </div>
+      <div id="compare-result"></div>
+    </div>
+  </aside>
+</div>
+
+<div id="toast-wrap"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
