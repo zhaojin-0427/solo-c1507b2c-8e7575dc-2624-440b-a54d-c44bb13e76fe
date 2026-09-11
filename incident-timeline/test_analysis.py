@@ -162,5 +162,57 @@ class TestUnresolvedConsistency(unittest.TestCase):
             assert_plan_consistent(self, events, deps, [], p)
 
 
+class TestChainPropagation(unittest.TestCase):
+    """回归: 锁定 E3 时, min_total 必须让调整沿后继链 E3→E2→E1 传播,
+    而不是只修 E1 的时长就把 E3→E2 倒置留作未解决。"""
+
+    DEPS = [dep(1, 'before', 3, 2), dep(2, 'before', 2, 1)]
+
+    def test_propagates_along_successor_chain(self):
+        # E3 锁定 [0,3000]; E2=[500,1500]; E1=[1500,500] 结束早于开始
+        events = [ev(1, 1500, 500), ev(2, 500, 1500), ev(3, 0, 3000, locked=1)]
+        p = plans_by_strategy(events, self.DEPS)['min_total']
+        # 链上矛盾全部消除
+        self.assertEqual(p['unresolved'], [])
+        # E3 不动; E2 顺延到 E3 之后; E1 顺延到 E2 之后并修复时长
+        by_id = {m['event_id']: m for m in p['moves']}
+        self.assertNotIn(3, by_id)
+        self.assertEqual((by_id[2]['delta_start_ms'], by_id[2]['delta_end_ms']),
+                         (2500, 2500))
+        self.assertEqual((by_id[1]['delta_start_ms'], by_id[1]['delta_end_ms']),
+                         (2500, 3500))
+        # 总移动量按起止端点实际变化计算
+        self.assertEqual(p['total_shift_ms'], 2500 + 3500)
+        # 应用后区间: E3 不变, E2=[3000,4000], E1=[4000,4000]
+        after = {e['id']: e for e in assert_plan_consistent(
+            self, events, self.DEPS, [], p)}
+        self.assertEqual((after[3]['start_ts'], after[3]['end_ts']), (0, 3000))
+        self.assertEqual((after[2]['start_ts'], after[2]['end_ts']), (3000, 4000))
+        self.assertEqual((after[1]['start_ts'], after[1]['end_ts']), (4000, 4000))
+        self.assertEqual(detect(list(after.values()), self.DEPS, []), [])
+
+    def test_propagates_with_mid_chain_variant(self):
+        # 同链不同位置: E2=[1000,2000], E1=[1500,500]
+        events = [ev(1, 1500, 500), ev(2, 1000, 2000), ev(3, 0, 3000, locked=1)]
+        p = plans_by_strategy(events, self.DEPS)['min_total']
+        self.assertEqual(p['unresolved'], [])
+        self.assertEqual(p['total_shift_ms'], 2000 + 3500)
+        after = {e['id']: e for e in assert_plan_consistent(
+            self, events, self.DEPS, [], p)}
+        self.assertEqual((after[2]['start_ts'], after[2]['end_ts']), (3000, 4000))
+        self.assertEqual((after[1]['start_ts'], after[1]['end_ts']), (4000, 4000))
+        self.assertEqual(detect(list(after.values()), self.DEPS, []), [])
+
+    def test_min_total_is_minimal_over_chain(self):
+        # 传播方案的总移动量应等于理论下界:
+        # E2 至少 +2500(E3 锁定), E1 至少 +2500 且时长修复 1000
+        events = [ev(1, 1500, 500), ev(2, 500, 1500), ev(3, 0, 3000, locked=1)]
+        plans = plans_by_strategy(events, self.DEPS)
+        mt = plans['min_total']
+        self.assertEqual(mt['total_shift_ms'], 6000)
+        self.assertLessEqual(mt['total_shift_ms'],
+                             plans['push_later']['total_shift_ms'])
+
+
 if __name__ == '__main__':
     unittest.main()

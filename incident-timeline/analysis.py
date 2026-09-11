@@ -487,74 +487,117 @@ def _workable(confs, sim, excluded=()):
     return out
 
 
-def _choose_fix(options, strategy, tried=()):
-    """贪心策略: 从有效修复动作中选一个(避开本冲突已尝试过的)。"""
+def _rank_fixes(options, strategy, tried=()):
+    """贪心策略: 有效修复动作按策略偏好排序(避开本冲突已尝试过的)。"""
     avail = [o for o in options if _op_sig(o) not in tried]
     if not avail:
-        return None
+        return []
 
     def net(o):
         return sum(ds + de for _, ds, de in o)
 
     if strategy == 'push_later':
-        return min(avail, key=lambda o: (net(o) < 0, _op_cost(o)))
+        return sorted(avail, key=lambda o: (net(o) < 0, _op_cost(o)))
     if strategy == 'pull_earlier':
-        return min(avail, key=lambda o: (net(o) > 0, _op_cost(o)))
-    return min(avail, key=_op_cost)
+        return sorted(avail, key=lambda o: (net(o) > 0, _op_cost(o)))
+    return sorted(avail, key=_op_cost)
+
+
+def _sig_after(sim, op):
+    """应用修复动作后的状态签名(不改动 sim)。"""
+    deltas = {eid: (ds, de) for eid, ds, de in op}
+    sig = []
+    for i, s in sim.items():
+        ds, de = deltas.get(i, (0, 0))
+        en = s['end_ts'] + de if s['end_ts'] is not None else None
+        sig.append((i, s['start_ts'] + ds, en))
+    return tuple(sorted(sig))
 
 
 def _greedy(events, deps, excls, strategy, excluded=frozenset(), max_iter=200):
-    """贪心迭代求解, 返回 (方案, 被判定不可解的冲突键集合)。
-
-    同一冲突的每个修复选项只尝试一次: 全部试过却仍然存在的冲突
-    (典型如因果环上互相矛盾的前置约束)判定为不可解——继续修只会
-    让事件位移在振荡中无限增大。
-    """
+    """贪心迭代求解。每个修复动作应用前做状态级振荡检测: 会让全局状态
+    回到已见值的动作(如"把刚沿链移后的事件又移回去")直接跳过, 改选
+    下一候选, 使调整能沿后继链传播; 全部候选都试过或都会导致振荡的
+    冲突留在未解决清单中。"""
     sim = {e['id']: dict(e) for e in events}
     initial = detect(list(sim.values()), deps, excls)
     tried = defaultdict(set)
+    seen = {_state_sig(sim)}
     confs = initial
     for _ in range(max_iter):
         op = chosen = None
         for key, c, valid in _workable(confs, sim, excluded):
-            op = _choose_fix(valid, strategy, tried[key])
+            for o in _rank_fixes(valid, strategy, tried[key]):
+                if _sig_after(sim, o) in seen:
+                    tried[key].add(_op_sig(o))   # 导致振荡的动作, 不再选
+                    continue
+                op, chosen = o, key
+                break
             if op:
-                chosen = key
                 break
         if not op:
             break
         tried[chosen].add(_op_sig(op))
         _apply_op(sim, op)
+        seen.add(_state_sig(sim))
         confs = detect(list(sim.values()), deps, excls)
-    exhausted = set()
-    for key, c, valid in _workable(confs, sim, excluded):
-        if all(_op_sig(o) in tried[key] for o in valid):
-            exhausted.add(key)
-    return _plan_from_sim(events, sim, initial, confs), exhausted
+    return _plan_from_sim(events, sim, initial, confs)
+
+
+def _infeasible_cycle_dep_ids(events, deps):
+    """差分约束可行性判定: 环上 (from 事件时长 + 最小间隔) 权重之和 > 0
+    的依赖环, 任何时间赋值都无法满足(如两条互相矛盾的"先于"且事件
+    有时长)。返回这些环上依赖的 id 集合。before/triggers 修复只做整体
+    平移, 时长不变, 因此用当前时长判定是精确的。
+    """
+    evs = {e['id']: e for e in events}
+    infeasible = set()
+    for cyc in find_cycles(deps, [e['id'] for e in events]):
+        weight = 0
+        cyc_dep_ids = []
+        for (u, d, _label, _v) in cyc:
+            cyc_dep_ids.append(d['id'])
+            if d['type'] == 'before':
+                src = evs.get(d['from_id'])
+                if src is not None:
+                    weight += ev_end(src) - src['start_ts']
+                weight += d.get('min_gap_ms') or 0
+            elif d['type'] == 'triggers':
+                weight += d.get('min_gap_ms') or 0
+            # during 派生边权重为 0(只约束开始先后)
+        if weight > 0:
+            infeasible.update(cyc_dep_ids)
+    return infeasible
+
+
+def _structural_excluded(events, deps, excls):
+    """不可解冲突的键集合: 依赖落在不可行环上的冲突, 移动事件无法消除,
+    求解时应排除(留在未解决清单中如实报告)。"""
+    bad_deps = _infeasible_cycle_dep_ids(events, deps)
+    if not bad_deps:
+        return frozenset()
+    return frozenset(_ckey(c) for c in detect(events, deps, excls)
+                     if any(d in bad_deps for d in (c.get('dep_ids') or [])))
 
 
 def _solve(events, deps, excls, strategy):
-    """两阶段贪心: 先探测出不可解冲突并排除, 再求解得到干净的方案。"""
-    probe, exhausted = _greedy(events, deps, excls, strategy)
-    if not exhausted:
-        return probe
-    plan, _ = _greedy(events, deps, excls, strategy, excluded=exhausted)
-    return plan
+    """贪心求解: 排除不可行环上的冲突后迭代修复。"""
+    excluded = _structural_excluded(events, deps, excls)
+    return _greedy(events, deps, excls, strategy, excluded=excluded)
 
 
 def _solve_optimal(events, deps, excls, max_expand=5000):
-    """min_total: 排除不可解冲突后, 在状态空间上 Dijkstra 搜索最小总移动量。
+    """min_total: 排除不可行环上的冲突后, 在状态空间上 Dijkstra 搜索
+    总移动量最小的无冲突方案(调整沿后继链传播, 锁定事件不动)。
 
-    先用贪心探测识别不可解冲突(所有修复选项都试过仍存在的),
-    排除后剩余冲突均可解; 此时目标状态 = 不存在可行修复, 边权 =
-    修复动作代价(非负), 首个出队的目标状态即总移动量最小的方案。
-    同一冲突沿一条路径的修复尝试次数受限, 超出扩展上限回退贪心。
-    锁定事件不参与移动。
+    目标状态 = 不存在可行修复; 边权 = 修复动作代价(非负), 首个出队的
+    目标状态即最优。同一冲突沿一条路径的修复尝试次数受限; 超出扩展
+    上限时回退为贪心结果。
     """
-    _probe, exhausted = _greedy(events, deps, excls, 'min_total')
+    excluded = _structural_excluded(events, deps, excls)
     sim0 = {e['id']: dict(e) for e in events}
     initial = detect(list(sim0.values()), deps, excls)
-    if not _workable(initial, sim0, exhausted):
+    if not _workable(initial, sim0, excluded):
         return _plan_from_sim(events, sim0, initial, initial)
 
     INF = 10 ** 18
@@ -569,7 +612,7 @@ def _solve_optimal(events, deps, excls, max_expand=5000):
         expands += 1
         att = dict(attempts)
         confs = detect(list(sim.values()), deps, excls)
-        workable = _workable(confs, sim, exhausted)
+        workable = _workable(confs, sim, excluded)
         if not workable:
             best = (sim, confs)
             break
@@ -588,7 +631,7 @@ def _solve_optimal(events, deps, excls, max_expand=5000):
                 heapq.heappush(pq, (ncost, counter, nsim, natt))
                 counter += 1
     if best is None:
-        return _solve(events, deps, excls, 'min_total')   # 超预算, 回退两阶段贪心
+        return _solve(events, deps, excls, 'min_total')   # 超预算, 回退贪心
     sim, confs = best
     return _plan_from_sim(events, sim, initial, confs)
 
