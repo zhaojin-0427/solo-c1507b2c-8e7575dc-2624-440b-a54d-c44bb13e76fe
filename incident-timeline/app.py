@@ -10,6 +10,7 @@ import time
 from flask import Flask, Response, g, jsonify, render_template, request
 
 import analysis
+import calibration as calib
 import export as export_mod
 from timeutil import parse_time
 
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS events (
   locked INTEGER DEFAULT 0,
   group_name TEXT DEFAULT '',
   color TEXT DEFAULT '',
+  clock_source_id INTEGER,
   created_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS dependencies (
@@ -55,6 +57,31 @@ CREATE TABLE IF NOT EXISTS revisions (
   created_at INTEGER,
   pinned INTEGER DEFAULT 0,
   snapshot TEXT
+);
+CREATE TABLE IF NOT EXISTS clock_sources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  is_baseline INTEGER DEFAULT 0,
+  created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS calibration_points (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  a_event_id INTEGER NOT NULL,
+  b_event_id INTEGER NOT NULL,
+  a_source_id INTEGER NOT NULL,
+  b_source_id INTEGER NOT NULL,
+  tolerance_ms INTEGER DEFAULT 1000,
+  note TEXT DEFAULT '',
+  created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS calibration_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  label TEXT,
+  created_at INTEGER,
+  active INTEGER DEFAULT 0,
+  signature TEXT,
+  detail TEXT
 );
 """
 
@@ -81,6 +108,17 @@ def close_db(_exc):
 def init_db():
     db = sqlite3.connect(DB_PATH)
     db.executescript(SCHEMA)
+    # 旧库迁移
+    ev_cols = [r[1] for r in db.execute('PRAGMA table_info(events)')]
+    if 'clock_source_id' not in ev_cols:
+        db.execute('ALTER TABLE events ADD COLUMN clock_source_id INTEGER')
+    cs_cols = [r[1] for r in db.execute('PRAGMA table_info(clock_sources)')]
+    if 'lock_source' not in cs_cols:
+        db.execute('ALTER TABLE clock_sources ADD COLUMN lock_source INTEGER DEFAULT 0')
+    if 'lock_offset_ms' not in cs_cols:
+        db.execute('ALTER TABLE clock_sources ADD COLUMN lock_offset_ms REAL')
+    if 'lock_drift_ms_per_hour' not in cs_cols:
+        db.execute('ALTER TABLE clock_sources ADD COLUMN lock_drift_ms_per_hour REAL')
     db.commit()
     db.close()
 
@@ -91,6 +129,29 @@ def load_state():
     deps = [dict(r) for r in db.execute('SELECT * FROM dependencies ORDER BY id')]
     excls = [dict(r) for r in db.execute('SELECT * FROM exclusions ORDER BY id')]
     return events, deps, excls
+
+
+def load_clock():
+    db = get_db()
+    sources = [dict(r) for r in db.execute('SELECT * FROM clock_sources ORDER BY id')]
+    points = [dict(r) for r in db.execute('SELECT * FROM calibration_points ORDER BY id')]
+    versions = [dict(r) for r in
+                db.execute('SELECT * FROM calibration_versions ORDER BY id DESC')]
+    return sources, points, versions
+
+
+def current_locks(sources):
+    """锁定状态存于 clock_sources 行内(lock_source / lock_offset_ms /
+    lock_drift_ms_per_hour 三列, 迁移时补列)。"""
+    locks = {'sources': [], 'offset': {}, 'drift': {}}
+    for s in sources:
+        if s.get('lock_source'):
+            locks['sources'].append(s['id'])
+        if s.get('lock_offset_ms') is not None:
+            locks['offset'][s['id']] = float(s['lock_offset_ms'])
+        if s.get('lock_drift_ms_per_hour') is not None:
+            locks['drift'][s['id']] = float(s['lock_drift_ms_per_hour'])
+    return locks
 
 
 def push_snapshot(label):
@@ -133,6 +194,140 @@ def restore_snapshot(snap):
     db.commit()
 
 
+def _calibrated_event_view(events, fit_result):
+    """按校准结果生成'校准时间'事件视图(不改原始记录);
+    无归属来源或来源不连通的事件保持原时间。返回 (视图事件, {id: shift})。"""
+    view, shifts = [], {}
+    for e in events:
+        v = dict(e)
+        sid = e.get('clock_source_id')
+        if sid is not None and fit_result is not None:
+            cs = calib.calibrated_ts(e['start_ts'], sid, fit_result)
+            if cs is not None:
+                v['start_ts'] = round(cs)
+                shifts[e['id']] = v['start_ts'] - e['start_ts']
+                if e.get('end_ts') is not None:
+                    ce = calib.calibrated_ts(e['end_ts'], sid, fit_result)
+                    if ce is not None:
+                        v['end_ts'] = round(ce)
+        view.append(v)
+    return view, shifts
+
+
+def _calibration_state():
+    """组装时钟校准全部派生状态: 活拟合/诊断/候选/校准后分析/版本。"""
+    events, deps, excls = load_state()
+    sources, points, versions = load_clock()
+    locks = current_locks(sources)
+    sig = calib.version_signature(sources, points)
+
+    live = None
+    issues, point_diag, chains = [], [], {}
+    live_fit = None
+    if sources:
+        try:
+            live_fit = calib.fit(sources, points, events, locks)
+        except calib.LinAlgError as ex:
+            issues.append({'kind': 'locks_conflict',
+                           'message': f'锁定参数互相矛盾, 无法求解: {ex}'})
+            live_fit = calib.fit(sources, points, events,
+                                 {'sources': [], 'offset': {}, 'drift': {}})
+        chains, _base = calib.reachable_from_baseline(sources, points)
+        point_diag = calib.diagnose_points(sources, points, events, live_fit)
+        issues += calib.source_issues(sources, points, events, live_fit)
+        live = calib._public_fit(live_fit, sources, points)
+
+    # 激活版本 / 过期判断(须在校准视图计算之前确定使用哪套参数)
+    active = next((v for v in versions if v.get('active')), None)
+    active_detail = json.loads(active['detail']) if active else None
+    stale = bool(active and active.get('signature') != sig)
+
+    # 校准视图优先采用激活版本参数; 版本过期(校准关系已变化)时回退 live,
+    # 版本摘要仍保留用于对照, 并明确提示过期。
+    version_fit = None
+    if active_detail and not stale:
+        version_fit = {
+            'params': {p['source_id']: {
+                'correction_ms': p['correction_ms'],
+                'offset_ms': p['offset_ms'],
+                'drift_ms_per_hour': p['drift_ms_per_hour'],
+            } for p in active_detail['fit']['params']},
+            't0': active_detail['fit'].get('t0', 0.0),
+            'base_id': active_detail['fit'].get('base_id'),
+            'residuals': {int(k): v for k, v in
+                          active_detail['fit']['residuals'].items()},
+        }
+    view_fit = version_fit if version_fit is not None else live_fit
+
+    # 校准后的事件视图与冲突分析
+    cal_events, shifts = _calibrated_event_view(
+        events, view_fit if sources and not any(i['kind'] == 'baseline'
+                                                for i in issues) else None)
+    cal_analysis = analysis.analyze(cal_events, deps, excls)
+    # 校准视图中冲突身份集合(供时间轴叠加)
+    raw_analysis = analysis.analyze(events, deps, excls)
+    raw_conf_ids = _conflict_identities(raw_analysis)
+    cal_conf_ids = _conflict_identities(cal_analysis)
+
+    # 误差带(每个来源一个半宽), 与当前视图参数一致
+    bands = {}
+    if view_fit is not None:
+        for s in sources:
+            bands[s['id']] = calib.uncertainty_band(
+                s['id'], view_fit.get('t0', 0.0), points, view_fit, chains)
+
+    version_list = [{
+        'id': v['id'], 'label': v['label'], 'created_at': v['created_at'],
+        'active': bool(v['active']), 'stale': v['signature'] != sig,
+        'signature': v['signature'],
+    } for v in versions]
+
+    return {
+        'sources': sources,
+        'points': points,
+        'locks': locks,
+        'live_fit': live,
+        'issues': issues,
+        'point_diagnostics': point_diag,
+        'bands_ms': {str(k): v for k, v in bands.items()},
+        'shifts_ms': {str(k): v for k, v in shifts.items()},
+        'calibrated_analysis': cal_analysis,
+        'raw_conflict_keys': sorted(raw_conf_ids),
+        'cal_conflict_keys': sorted(cal_conf_ids),
+        'signature': sig,
+        'versions': version_list,
+        'active_version_id': active['id'] if active else None,
+        'active_version_stale': stale,
+        'active_version': _version_summary(active_detail, sources) if active_detail else None,
+    }
+
+
+def _conflict_identities(an):
+    """冲突身份集合: (type, dep_ids 排序, event_ids 排序), 用于原始/校准对照。"""
+    out = set()
+    for c in an['conflicts']:
+        out.add((c['type'],
+                 tuple(sorted(c.get('dep_ids') or [])),
+                 tuple(sorted(c.get('event_ids') or []))))
+    return out
+
+
+def _version_summary(detail, sources):
+    """版本对外摘要(去掉候选大对象, 保留参数与指标)。"""
+    fit = detail.get('fit', {})
+    return {
+        'plan_key': detail.get('plan_key'),
+        'plan_name': detail.get('plan_name'),
+        'params': fit.get('params', []),
+        't0': fit.get('t0'),
+        'metrics': {k: detail.get(k) for k in
+                    ('conflict_count', 'total_correction_ms',
+                     'max_residual_ms', 'sigma_ms',
+                     'contradictory_point_ids', 'dropped_point_ids')},
+        'locks': detail.get('locks', {}),
+    }
+
+
 def state_json():
     events, deps, excls = load_state()
     db = get_db()
@@ -141,6 +336,7 @@ def state_json():
         'dependencies': deps,
         'exclusions': excls,
         'analysis': analysis.analyze(events, deps, excls),
+        'calibration': _calibration_state(),
         'can_undo': db.execute('SELECT 1 FROM revisions WHERE pinned=0 LIMIT 1').fetchone() is not None,
         'has_baseline': db.execute('SELECT 1 FROM revisions WHERE pinned=1 LIMIT 1').fetchone() is not None,
     }
@@ -187,6 +383,9 @@ def _event_fields(data, existing=None):
     for k in ('description', 'source', 'evidence', 'group_name', 'color'):
         if k in data:
             f[k] = str(data[k])
+    if 'clock_source_id' in data:
+        v = data['clock_source_id']
+        f['clock_source_id'] = int(v) if v not in (None, '', 0, '0') else None
     if 'confidence' in data:
         if data['confidence'] not in CONFIDENCES:
             raise ValueError('置信度须为 high/medium/low')
@@ -244,6 +443,8 @@ def delete_event(eid):
     db.execute('DELETE FROM events WHERE id=?', (eid,))
     db.execute('DELETE FROM dependencies WHERE from_id=? OR to_id=?', (eid, eid))
     db.execute('DELETE FROM exclusions WHERE a_id=? OR b_id=?', (eid, eid))
+    db.execute('DELETE FROM calibration_points WHERE a_event_id=? OR b_event_id=?',
+               (eid, eid))
     db.commit()
     return jsonify(state_json())
 
@@ -477,6 +678,250 @@ def apply_plan():
     return jsonify(state_json())
 
 
+# ---------------------------------------------------------------- 时钟来源
+
+@app.post('/api/clock_sources')
+def create_clock_source():
+    data = request.get_json(force=True)
+    name = str(data.get('name', '')).strip()
+    if not name:
+        return err('时钟来源名称不能为空')
+    db = get_db()
+    cur = db.execute(
+        'INSERT INTO clock_sources(name, description, is_baseline, created_at) '
+        'VALUES (?,?,?,?)',
+        (name, str(data.get('description', '')),
+         1 if data.get('is_baseline') else 0, int(time.time())))
+    if data.get('is_baseline'):
+        db.execute('UPDATE clock_sources SET is_baseline=0 WHERE id<>?',
+                   (cur.lastrowid,))
+    db.commit()
+    return jsonify(state_json())
+
+
+@app.put('/api/clock_sources/<int:sid>')
+def update_clock_source(sid):
+    db = get_db()
+    row = db.execute('SELECT * FROM clock_sources WHERE id=?', (sid,)).fetchone()
+    if not row:
+        return err('时钟来源不存在', 404)
+    data = request.get_json(force=True)
+    if 'name' in data:
+        name = str(data['name']).strip()
+        if not name:
+            return err('名称不能为空')
+        db.execute('UPDATE clock_sources SET name=?, description=? WHERE id=?',
+                   (name, str(data.get('description', row['description'])), sid))
+    if data.get('is_baseline'):
+        db.execute('UPDATE clock_sources SET is_baseline=0')
+        db.execute('UPDATE clock_sources SET is_baseline=1 WHERE id=?', (sid,))
+    db.commit()
+    return jsonify(state_json())
+
+
+@app.delete('/api/clock_sources/<int:sid>')
+def delete_clock_source(sid):
+    db = get_db()
+    row = db.execute('SELECT * FROM clock_sources WHERE id=?', (sid,)).fetchone()
+    if not row:
+        return err('时钟来源不存在', 404)
+    if row['is_baseline']:
+        return err('不能删除基准时钟来源, 请先指定其他来源为基准')
+    db.execute('DELETE FROM clock_sources WHERE id=?', (sid,))
+    db.execute('DELETE FROM calibration_points WHERE a_source_id=? OR b_source_id=?',
+               (sid, sid))
+    db.execute('UPDATE events SET clock_source_id=NULL WHERE clock_source_id=?', (sid,))
+    db.execute('UPDATE clock_sources SET lock_source=0, lock_offset_ms=NULL, '
+               'lock_drift_ms_per_hour=NULL WHERE id=?', (sid,))
+    db.commit()
+    return jsonify(state_json())
+
+
+@app.post('/api/clock_sources/<int:sid>/locks')
+def update_locks(sid):
+    """设置锁定。body:
+    {"lock_source": bool, "lock_offset_ms": number|null,
+     "lock_drift_ms_per_hour": number|null}"""
+    db = get_db()
+    row = db.execute('SELECT * FROM clock_sources WHERE id=?', (sid,)).fetchone()
+    if not row:
+        return err('时钟来源不存在', 404)
+    if row['is_baseline']:
+        return err('基准来源的时钟恒为 0, 无需锁定')
+    data = request.get_json(force=True) or {}
+    ls = 1 if data.get('lock_source') else 0
+    lo = data.get('lock_offset_ms')
+    ld = data.get('lock_drift_ms_per_hour')
+    lo = float(lo) if lo not in (None, '') else None
+    ld = float(ld) if ld not in (None, '') else None
+    db.execute('UPDATE clock_sources SET lock_source=?, lock_offset_ms=?, '
+               'lock_drift_ms_per_hour=? WHERE id=?', (ls, lo, ld, sid))
+    db.commit()
+    return jsonify(state_json())
+
+
+# ---------------------------------------------------------------- 校准点
+
+@app.post('/api/calibration_points')
+def create_calibration_point():
+    data = request.get_json(force=True)
+    try:
+        a_eid, b_eid = int(data['a_event_id']), int(data['b_event_id'])
+        a_sid, b_sid = int(data['a_source_id']), int(data['b_source_id'])
+        tol = max(int(round(float(data.get('tolerance_ms', 1000))),), 0)
+    except (KeyError, TypeError, ValueError) as ex:
+        return err(f'参数错误: {ex}')
+    if a_eid == b_eid:
+        return err('校准点需要两个不同的事件')
+    db = get_db()
+    n = db.execute('SELECT COUNT(*) c FROM events WHERE id IN (?,?)',
+                   (a_eid, b_eid)).fetchone()['c']
+    if n < 2:
+        return err('引用了不存在的事件')
+    s = db.execute('SELECT COUNT(*) c FROM clock_sources WHERE id IN (?,?)',
+                   (a_sid, b_sid)).fetchone()['c']
+    if s < 2:
+        return err('引用了不存在的时钟来源')
+    if a_sid == b_sid:
+        return err('两个事件应来自不同时钟来源')
+    dup = db.execute(
+        'SELECT id FROM calibration_points WHERE '
+        '((a_event_id=? AND b_event_id=?) OR (a_event_id=? AND b_event_id=?)) LIMIT 1',
+        (a_eid, b_eid, b_eid, a_eid)).fetchone()
+    if dup:
+        return err(f'这两个事件已在校准点 #{dup["id"]} 中配对')
+    db.execute(
+        'INSERT INTO calibration_points(a_event_id,b_event_id,a_source_id,'
+        'b_source_id,tolerance_ms,note,created_at) VALUES (?,?,?,?,?,?,?)',
+        (a_eid, b_eid, a_sid, b_sid, tol, str(data.get('note', '')),
+         int(time.time())))
+    db.commit()
+    return jsonify(state_json())
+
+
+@app.put('/api/calibration_points/<int:pid>')
+def update_calibration_point(pid):
+    db = get_db()
+    row = db.execute('SELECT * FROM calibration_points WHERE id=?', (pid,)).fetchone()
+    if not row:
+        return err('校准点不存在', 404)
+    data = request.get_json(force=True) or {}
+    fields = []
+    vals = []
+    if 'tolerance_ms' in data:
+        try:
+            tol = max(int(round(float(data['tolerance_ms']))), 0)
+        except (TypeError, ValueError):
+            return err('允许误差须为数字(毫秒)')
+        fields.append('tolerance_ms=?'); vals.append(tol)
+    if 'note' in data:
+        fields.append('note=?'); vals.append(str(data['note']))
+    if fields:
+        vals.append(pid)
+        db.execute(f'UPDATE calibration_points SET {",".join(fields)} WHERE id=?', vals)
+        db.commit()
+    return jsonify(state_json())
+
+
+@app.delete('/api/calibration_points/<int:pid>')
+def delete_calibration_point(pid):
+    db = get_db()
+    db.execute('DELETE FROM calibration_points WHERE id=?', (pid,))
+    db.commit()
+    return jsonify(state_json())
+
+
+# ---------------------------------------------------------------- 候选 / 版本
+
+def _candidate_plans():
+    events, deps, excls = load_state()
+    sources, points, _ = load_clock()
+    locks = current_locks(sources)
+
+    def conflict_count(cal_map):
+        view = []
+        for e in events:
+            v = dict(e)
+            m = cal_map.get(e['id'])
+            if m:
+                v['start_ts'] = round(m['start_ts'])
+                v['end_ts'] = round(m['end_ts']) if m['end_ts'] is not None else None
+            view.append(v)
+        an = analysis.analyze(view, deps, excls)
+        return sum(1 for c in an['conflicts'] if c['severity'] in ('high', 'medium'))
+
+    return calib.candidates(sources, points, events, locks, deps, excls,
+                            conflict_count)
+
+
+@app.post('/api/calibration/candidates')
+def api_candidates():
+    sources, _, _ = load_clock()
+    if not sources:
+        return err('请先建立时钟来源')
+    try:
+        plans = _candidate_plans()
+    except calib.LinAlgError as ex:
+        return err(f'锁定参数互相矛盾, 无法求解: {ex}')
+    return jsonify({'plans': plans})
+
+
+@app.post('/api/calibration/versions')
+def save_calibration_version():
+    """把选定候选另存为校准版本(不改写事件原始时间)。
+    body: {"plan_key": "robust", "label": "..."}"""
+    data = request.get_json(force=True) or {}
+    plan_key = data.get('plan_key')
+    plans = _candidate_plans()
+    plan = next((p for p in plans if p['key'] == plan_key), None)
+    if plan is None:
+        return err('候选方案不存在')
+    sources, points, _ = load_clock()
+    sig = calib.version_signature(sources, points)
+    detail = json.dumps({
+        'plan_key': plan['key'], 'plan_name': plan['name'],
+        'fit': plan['fit'],
+        'conflict_count': plan['conflict_count'],
+        'total_correction_ms': plan['total_correction_ms'],
+        'max_residual_ms': plan['max_residual_ms'],
+        'sigma_ms': plan['sigma_ms'],
+        'contradictory_point_ids': plan['contradictory_point_ids'],
+        'dropped_point_ids': plan['dropped_point_ids'],
+        'locks': current_locks(sources),
+    }, ensure_ascii=False)
+    db = get_db()
+    cur = db.execute(
+        'INSERT INTO calibration_versions(label, created_at, active, signature, detail) '
+        'VALUES (?,?,0,?,?)',
+        (str(data.get('label') or plan['name']).strip() or plan['name'],
+         int(time.time()), sig, detail))
+    # 新版本默认激活
+    db.execute('UPDATE calibration_versions SET active=0')
+    db.execute('UPDATE calibration_versions SET active=1 WHERE id=?', (cur.lastrowid,))
+    db.commit()
+    return jsonify(state_json())
+
+
+@app.post('/api/calibration/versions/<int:vid>/activate')
+def activate_calibration_version(vid):
+    db = get_db()
+    row = db.execute('SELECT id FROM calibration_versions WHERE id=?', (vid,)).fetchone()
+    if not row:
+        return err('校准版本不存在', 404)
+    db.execute('UPDATE calibration_versions SET active=0')
+    db.execute('UPDATE calibration_versions SET active=1 WHERE id=?', (vid,))
+    db.commit()
+    return jsonify(state_json())
+
+
+@app.delete('/api/calibration/versions/<int:vid>')
+def delete_calibration_version(vid):
+    db = get_db()
+    db.execute('DELETE FROM calibration_versions WHERE id=?', (vid,))
+    db.commit()
+    return jsonify(state_json())
+
+
 # ---------------------------------------------------------------- 导出 / 演示 / 清空
 
 @app.get('/api/export')
@@ -510,6 +955,9 @@ def _clear_all():
     db.execute('DELETE FROM events')
     db.execute('DELETE FROM dependencies')
     db.execute('DELETE FROM exclusions')
+    db.execute('DELETE FROM calibration_points')
+    db.execute('DELETE FROM clock_sources')
+    db.execute('DELETE FROM calibration_versions')
     db.commit()
 
 
@@ -559,6 +1007,8 @@ def _insert_demo():
             (title, s, e, Z, conf, src, evi, grp, locked, int(time.time())))
         ids.append(cur.lastrowid)
 
+    _insert_demo_clocks(db, ids, t)
+
     deps = [
         # type, from_idx, to_idx, min_gap_s, max_gap_s, note
         ('before', 0, 2, 0, None, '发布应先于告警结束(发布团队说法)'),
@@ -577,6 +1027,115 @@ def _insert_demo():
     db.execute('INSERT INTO exclusions(a_id,b_id,reason) VALUES (?,?,?)',
                (ids[3], ids[11], '主库高负载时不应处于只读模式(状态互斥)'))
     db.commit()
+
+
+def _insert_demo_clocks(db, ids, t):
+    """多源时钟校准演示:
+      - NTP 基准(Prometheus/CloudWatch 走机房授时, 视为基准);
+      - cache-node-7 日志机: 时钟慢约 4 分钟, 记录值早于真实时间;
+      - 边缘网关客服系统: 有轻微漂移;
+      - DBA 手抄记录: 只有一个配点, 漂移不可辨识(欠定示例)。
+    另有一条配点故意矛盾, 供稳健拟合识别剔除。
+    事件 ids 顺序见 _insert_demo: 2=告警 5=缓存重启 6=连接池耗尽
+    10=告警恢复 11=投诉高峰。
+    """
+    def add_source(name, desc, base=0):
+        cur = db.execute(
+            'INSERT INTO clock_sources(name,description,is_baseline,created_at) '
+            'VALUES (?,?,?,?)',
+            (name, desc, base, int(time.time())))
+        return cur.lastrowid
+
+    s_ntp = add_source('机房 NTP 授时(Prometheus/CloudWatch)',
+                       '监控与云指标统一走机房 NTP, 作为基准时钟', 1)
+    s_cache = add_source('cache-node-7 日志机',
+                         '本地 ntpd 故障, 时钟整体偏慢, 另有轻微漂移')
+    s_gw = add_source('边缘网关(客服系统)', '跨地域网关, 时钟有线性漂移')
+    s_dba = add_source('DBA 手抄记录', '人工回忆补记, 只有一条配点')
+
+    def mk_event(title, ts, src_id, text, group='校准时标'):
+        cur = db.execute(
+            'INSERT INTO events(title,start_ts,end_ts,timezone,confidence,source,'
+            'evidence,group_name,clock_source_id,created_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?)',
+            (title, ts, None, '+08:00', 'high', text, text, group, src_id,
+             int(time.time())))
+        return cur.lastrowid
+
+    # 把已有事件挂到来源
+    db.execute('UPDATE events SET clock_source_id=? WHERE id IN (?,?,?)',
+               (s_ntp, ids[2], ids[3], ids[9]))
+    db.execute('UPDATE events SET clock_source_id=? WHERE id IN (?,?)',
+               (s_cache, ids[5], ids[6]))
+    db.execute('UPDATE events SET clock_source_id=? WHERE id=?', (s_gw, ids[10]))
+    db.execute('UPDATE events SET clock_source_id=? WHERE id=?', (s_dba, ids[11]))
+
+    # cache-node-7 时钟(演示): 参考时刻慢约 250 秒 + 漂移 3 秒/天。
+    # 配点 1(13:59 附近): 缓存连接池耗尽, 缓存机日志(ids[6]=13:58:20) vs
+    # 基准侧监控代理观测(14:02:30), 差 250 秒
+    n_pool = mk_event('[校准时标] 连接池耗尽(基准侧观测)',
+                      t('14:02:30'), s_ntp, '14:02:30 NTP-synced: cache pool exhausted')
+    db.execute('INSERT INTO calibration_points'
+               '(a_event_id,b_event_id,a_source_id,b_source_id,tolerance_ms,note,created_at) '
+               'VALUES (?,?,?,?,?,?,?)',
+               (ids[6], n_pool, s_cache, s_ntp, 2000,
+                '连接池耗尽: 日志机 13:58:20 vs 基准 14:02:30(慢约 4 分 10 秒)',
+                int(time.time())))
+
+    # 配点 2(约 10 分钟后): 缓存服务恢复, 基准 14:08:00 vs 日志机 14:03:50
+    # (偏差 250 秒, 与配点1相差亚秒级 => 0.3 秒/天的微小漂移)
+    n_rec = mk_event('[校准时标] 缓存服务恢复(基准侧观测)',
+                     t('14:08:00'), s_ntp, '14:08:00 NTP-synced: cache service recovered')
+    c_rec = mk_event('[校准时标] 缓存服务恢复(缓存机日志)',
+                     t('14:03:50'), s_cache, '14:03:50 cache service recovered (local clock)')
+    db.execute('INSERT INTO calibration_points'
+               '(a_event_id,b_event_id,a_source_id,b_source_id,tolerance_ms,note,created_at) '
+               'VALUES (?,?,?,?,?,?,?)',
+               (c_rec, n_rec, s_cache, s_ntp, 2000,
+                '缓存恢复: 与配点1时刻拉开约 10 分钟, 亚秒级偏差 => 微小漂移',
+                int(time.time())))
+
+    # 矛盾配点: 缓存节点重启(ids[5]=13:59:00, 真实约 14:03:10)被人工错误对应到
+    # 14:06 的基准观测, 差近 3 分钟、远超标称误差;
+    # 普通拟合被带偏, 稳健拟合应剔除
+    n_bad = mk_event('[校准时标] 缓存重启(矛盾的人工对应)',
+                     t('14:06:00'), s_ntp, '14:06:00 人工猜测的重启时刻(与自动观测矛盾)')
+    db.execute('INSERT INTO calibration_points'
+               '(a_event_id,b_event_id,a_source_id,b_source_id,tolerance_ms,note,created_at) '
+               'VALUES (?,?,?,?,?,?,?)',
+               (ids[5], n_bad, s_cache, s_ntp, 2000,
+                '人工对应 14:06 与时钟推算的 ~14:03:10 矛盾(稳健拟合应剔除)',
+                int(time.time())))
+
+    # 边缘网关(客服): 慢约 5 秒, 且漂移明显(偏差 5s→6s, 约 96 秒/天)
+    g1 = mk_event('[校准时标] 投诉工单首件(网关时间戳)',
+                  t('14:10:00'), s_gw, '14:10:00 gateway ts, first complaint ticket')
+    n1 = mk_event('[校准时标] 投诉工单首件(受理系统时间)',
+                  t('14:10:05'), s_ntp, '14:10:05 support system, first complaint')
+    db.execute('INSERT INTO calibration_points'
+               '(a_event_id,b_event_id,a_source_id,b_source_id,tolerance_ms,note,created_at) '
+               'VALUES (?,?,?,?,?,?,?)',
+               (g1, n1, s_gw, s_ntp, 2000,
+                '投诉首件: 网关 14:10:00 vs 受理系统 14:10:05', int(time.time())))
+    g2 = mk_event('[校准时标] 投诉工单末件(网关时间戳)',
+                  t('14:25:00'), s_gw, '14:25:00 gateway ts, last complaint ticket')
+    n2 = mk_event('[校准时标] 投诉工单末件(受理系统时间)',
+                  t('14:25:06'), s_ntp, '14:25:06 support system, last complaint')
+    db.execute('INSERT INTO calibration_points'
+               '(a_event_id,b_event_id,a_source_id,b_source_id,tolerance_ms,note,created_at) '
+               'VALUES (?,?,?,?,?,?,?)',
+               (g2, n2, s_gw, s_ntp, 2000,
+                '投诉末件: 偏差增大到 6 秒, 说明网关时钟存在明显线性漂移',
+                int(time.time())))
+
+    # DBA 手抄: 只有一个配点 -> 漂移不可辨识(欠定), 偏移约 -20s
+    n_dba = mk_event('[校准时标] 只读切换(审计代理近似时刻)',
+                     t('14:08:20'), s_ntp, '14:08:20 audit proxy approximate time')
+    db.execute('INSERT INTO calibration_points'
+               '(a_event_id,b_event_id,a_source_id,b_source_id,tolerance_ms,note,created_at) '
+               'VALUES (?,?,?,?,?,?,?)',
+               (ids[11], n_dba, s_dba, s_ntp, 30000,
+                '仅一条配点, 只能估偏移, 漂移不可辨识', int(time.time())))
 
 
 init_db()

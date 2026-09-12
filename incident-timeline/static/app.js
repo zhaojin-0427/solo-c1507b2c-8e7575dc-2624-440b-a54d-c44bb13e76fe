@@ -96,6 +96,13 @@ const S = {
   hlConflict: null,      // 高亮的冲突 id
   displayTz: 'UTC',
   drag: null,
+  cal: null,             // 时钟校准状态(/api/state.calibration)
+  timeMode: 'raw',       // raw | calibrated
+  showBands: true,
+  showGhost: true,
+  candidates: null,      // 最近生成的候选方案
+  tracePointIds: null,   // 异常追溯: 高亮的校准点
+  warnedStale: false,
 };
 
 const PALETTE = ['#5b8def', '#f0a35e', '#5ec49a', '#e06c9f', '#9b7ede',
@@ -128,12 +135,79 @@ function applyState(data) {
   S.conflicts = data.analysis.conflicts;
   S.canUndo = data.can_undo;
   S.hasBaseline = data.has_baseline;
+  S.cal = data.calibration || null;
   if (!S.fittedOnce && S.events.length) {
     fitView();
     S.fittedOnce = true;
   }
   renderAll();
+  maybeWarnStale();
   return data;
+}
+
+// 当前显示用事件: 校准模式下用校准后时间(浅拷贝), 否则原始事件
+function activeCalParams() {
+  if (!S.cal) return null;
+  if (S.cal.active_version && !S.cal.active_version_stale) {
+    const m = {};
+    S.cal.active_version.params.forEach((p) => { m[p.source_id] = p; });
+    return { params: m, t0: S.cal.active_version.t0,
+             baseId: S.cal.active_version.params.find((p) => p.is_baseline)?.source_id };
+  }
+  if (S.cal.live_fit) {
+    const m = {};
+    S.cal.live_fit.params.forEach((p) => { m[p.source_id] = p; });
+    return { params: m, t0: S.cal.live_fit.t0, baseId: S.cal.live_fit.base_id };
+  }
+  return null;
+}
+
+function calibratedMs(ms, sid, cp) {
+  if (sid == null || !cp) return ms;
+  const p = cp.params[sid];
+  if (!p) return ms;
+  return ms + p.correction_ms + p.drift_ms_per_hour * (ms - cp.t0) / 3600000;
+}
+
+function calViewEvents() {
+  const cp = activeCalParams();
+  if (!cp) return S.events;
+  return S.events.map((e) => {
+    if (e.clock_source_id == null || !cp.params[e.clock_source_id]) return e;
+    const v = { ...e };
+    v.start_ts = Math.round(calibratedMs(e.start_ts, e.clock_source_id, cp));
+    if (e.end_ts != null) v.end_ts = Math.round(calibratedMs(e.end_ts, e.clock_source_id, cp));
+    return v;
+  });
+}
+
+function displayEvents() {
+  if (S.timeMode !== 'calibrated' || !S.cal) return S.events;
+  return S.cal.calibrated_analysis ? calViewEvents() : S.events;
+}
+
+function currentConflicts() {
+  if (S.timeMode === 'calibrated' && S.cal && S.cal.calibrated_analysis) {
+    return S.cal.calibrated_analysis.conflicts;
+  }
+  return S.conflicts;
+}
+
+function clockIssueCount() {
+  if (!S.cal) return 0;
+  const issues = (S.cal.issues || []).length;
+  const badPoints = (S.cal.point_diagnostics || [])
+    .filter((p) => p.status === 'contradictory' || p.status === 'dangling'
+      || p.status === 'same_source' || p.status === 'duplicate').length;
+  return issues + badPoints;
+}
+
+function maybeWarnStale() {
+  if (S.cal && S.cal.active_version_stale && !S.warnedStale) {
+    S.warnedStale = true;
+    toast('当前校准版本已过期: 校准关系发生了变化, 正在显示实时估计', true);
+  }
+  if (S.cal && !S.cal.active_version_stale) S.warnedStale = false;
 }
 
 function renderAll() {
@@ -142,11 +216,17 @@ function renderAll() {
   const badge = $('#conflict-badge');
   badge.textContent = n;
   badge.classList.toggle('zero', n === 0);
+  const calN = clockIssueCount();
+  const cb = $('#clock-badge');
+  cb.textContent = calN;
+  cb.classList.toggle('zero', calN === 0);
   $('#event-count').textContent = `(${S.events.length})`;
   renderTimeline();
   renderEventList();
   renderConflicts();
   renderDeps();
+  renderClockPanel();
+  renderVersionPill();
 }
 
 // ---------------------------------------------------------------- 时间轴
@@ -160,9 +240,10 @@ function timelineWidth() {
 }
 
 function fitView() {
-  if (!S.events.length) return;
-  const t0 = Math.min(...S.events.map((e) => e.start_ts));
-  const t1 = Math.max(...S.events.map(evEnd));
+  const evs = displayEvents();
+  if (!evs.length) return;
+  const t0 = Math.min(...evs.map((e) => e.start_ts));
+  const t1 = Math.max(...evs.map(evEnd));
   const span = Math.max(t1 - t0, 60000);
   const plotW = timelineWidth() - LEFT - RIGHT;
   S.view.pxPerMs = plotW / (span * 1.12);
@@ -195,7 +276,9 @@ function layoutLanes(events) {
 }
 
 function buildTimelineSVG(events, deps, opts) {
-  // opts: {interactive, view, width, hlConflict, conflicts, selectedId}
+  // opts: {interactive, view, width, hlConflict, conflicts, selectedId,
+  //        mode, rawEvents(原始时间副本), showBands, showGhost, bandsById,
+  //        traceEventIds, resolvedDeps:Set, newDeps:Set}
   const { view, width } = opts;
   const conflicts = opts.conflicts || [];
   const { lanes, pos } = layoutLanes(events);
@@ -205,6 +288,7 @@ function buildTimelineSVG(events, deps, opts) {
   const height = y + 10;
   const plotW = width - LEFT - RIGHT;
   const x = (t) => LEFT + (t - view.start) * view.pxPerMs;
+  const calibrated = opts.mode === 'calibrated';
 
   const badEvents = new Set(), badDeps = new Set();
   const hlEvents = new Set(), hlDeps = new Set();
@@ -219,6 +303,10 @@ function buildTimelineSVG(events, deps, opts) {
       (c.dep_ids || []).forEach((i) => hlDeps.add(i));
     }
   }
+  const traceIds = opts.traceEventIds || new Set();
+  const rawById = {};
+  (opts.rawEvents || []).forEach((e) => { rawById[e.id] = e; });
+  const bandsById = opts.bandsById || {};
 
   const P = [];
   P.push(`<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" ` +
@@ -227,6 +315,7 @@ function buildTimelineSVG(events, deps, opts) {
     <marker id="m-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8a93a6"/></marker>
     <marker id="m-arr-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#e5484d"/></marker>
     <marker id="m-arr-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#f0a35e"/></marker>
+    <marker id="m-arr-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5ec49a"/></marker>
   </defs>`);
   P.push(`<rect class="tl-bg" x="0" y="0" width="${width}" height="${height}" fill="#0f1218"/>`);
 
@@ -250,6 +339,45 @@ function buildTimelineSVG(events, deps, opts) {
     P.push(`<text x="27" y="${ly + 16}" font-size="11" fill="#c8cfdb" font-weight="bold">${esc(lane.name)}</text>`);
   });
 
+  // 误差带(校准模式): 每个有归属来源的事件, 在其校准位置画半透明带
+  if (calibrated && opts.showBands) {
+    events.forEach((e) => {
+      if (e.clock_source_id == null) return;
+      const p = pos[e.id];
+      if (!p) return;
+      const band = bandsById[e.clock_source_id];
+      if (band == null || band <= 0) return;
+      const ey = laneY[p.lane] + LANE_LABEL_H + p.row * ROW_H;
+      const half = band * view.pxPerMs;
+      const cx = x(e.start_ts);
+      if (e.end_ts == null) {
+        P.push(`<polygon class="band" points="${(cx - half).toFixed(1)},${ey + 1} ${cx.toFixed(1)},${ey + 9} ${(cx - half).toFixed(1)},${ey + 17} ${(cx - half - 5).toFixed(1)},${ey + 9}"/>`);
+        P.push(`<polygon class="band" points="${(cx + half).toFixed(1)},${ey + 1} ${(cx + half + 5).toFixed(1)},${ey + 9} ${(cx + half).toFixed(1)},${ey + 17} ${cx.toFixed(1)},${ey + 9}"/>`);
+      } else {
+        P.push(`<rect class="band" x="${(x(e.start_ts) - half).toFixed(1)}" y="${ey - 1}" `
+          + `width="${Math.max(2, (e.end_ts - e.start_ts) * view.pxPerMs + 2 * half).toFixed(1)}" height="20" rx="5"/>`);
+      }
+    });
+  }
+
+  // 校准前原始位置虚影(校准模式)
+  if (calibrated && opts.showGhost) {
+    events.forEach((e) => {
+      const raw = rawById[e.id];
+      if (!raw || (raw.start_ts === e.start_ts && raw.end_ts === e.end_ts)) return;
+      const p = pos[e.id];
+      if (!p) return;
+      const ey = laneY[p.lane] + LANE_LABEL_H + p.row * ROW_H;
+      if (raw.end_ts == null) {
+        const cx = x(raw.start_ts);
+        P.push(`<polygon class="ghost-poly" points="${cx.toFixed(1)},${ey + 2} ${(cx + 7).toFixed(1)},${ey + 9} ${cx.toFixed(1)},${ey + 16} ${(cx - 7).toFixed(1)},${ey + 9}"/>`);
+      } else {
+        const x1 = x(raw.start_ts), x2 = x(raw.end_ts);
+        P.push(`<rect class="ghost" x="${x1.toFixed(1)}" y="${ey}" width="${Math.max(3, x2 - x1).toFixed(1)}" height="18" rx="4"/>`);
+      }
+    });
+  }
+
   // 事件条
   const centers = {};
   events.forEach((e) => {
@@ -262,11 +390,19 @@ function buildTimelineSVG(events, deps, opts) {
     if (badEvents.has(e.id)) cls.push('bad');
     if (hlEvents.has(e.id)) cls.push('hl');
     if (opts.selectedId === e.id) cls.push('sel');
-    const stroke = hlEvents.has(e.id) ? '#f0a35e' : (badEvents.has(e.id) ? '#e5484d' : color);
-    const sw = hlEvents.has(e.id) || badEvents.has(e.id) ? 2.2 : 1.2;
+    if (calibrated) cls.push('calibrated');
+    if (traceIds.has(e.id)) cls.push('trace');
+    let stroke = hlEvents.has(e.id) || traceIds.has(e.id) ? '#f0a35e'
+      : (badEvents.has(e.id) ? '#e5484d' : color);
+    if (calibrated && !badEvents.has(e.id) && e.clock_source_id != null
+        && shiftForEvent(e) !== 0) stroke = '#5ec49a';
+    const sw = (hlEvents.has(e.id) || badEvents.has(e.id) || traceIds.size) ? 2.2 : 1.2;
     const dash = e.confidence === 'medium' ? ' stroke-dasharray="5 3"'
       : e.confidence === 'low' ? ' stroke-dasharray="2 3"' : '';
-    const label = `${esc(e.title)}${e.locked ? ' 🔒' : ''}`;
+    const tag = calibrated && e.clock_source_id != null && shiftForEvent(e) !== 0 ? ' ⌚' : '';
+    const label = `${esc(e.title)}${e.locked ? ' 🔒' : ''}${tag}`;
+    // 校准模式不允许拖动(原始时间不可改写)
+    const editable = opts.interactive && !e.locked && !calibrated;
     if (e.end_ts === null || e.end_ts === undefined) {
       const cx = x(e.start_ts);
       P.push(`<g class="${cls.join(' ')}" data-id="${e.id}">` +
@@ -277,7 +413,7 @@ function buildTimelineSVG(events, deps, opts) {
     } else {
       const x1 = x(e.start_ts), x2 = x(e.end_ts);
       const w = Math.max(3, x2 - x1);
-      const handles = opts.interactive && !e.locked
+      const handles = editable
         ? `<rect class="handle" data-id="${e.id}" data-side="l" x="${(x1 - 3).toFixed(1)}" y="${ey}" width="7" height="18" fill="transparent"/>` +
           `<rect class="handle" data-id="${e.id}" data-side="r" x="${(x1 + w - 4).toFixed(1)}" y="${ey}" width="7" height="18" fill="transparent"/>`
         : '';
@@ -298,9 +434,11 @@ function buildTimelineSVG(events, deps, opts) {
     const x1 = ca.x2 + 2, x2 = cb.x1 - 3;
     const violated = badDeps.has(d.id);
     const hl = hlDeps.has(d.id);
-    const color = hl ? '#f0a35e' : violated ? '#e5484d' : '#8a93a6';
-    const marker = hl ? 'm-arr-hl' : violated ? 'm-arr-red' : 'm-arr';
-    const dash = violated ? ' stroke-dasharray="4 3"' : '';
+    const resolved = calibrated && (opts.resolvedDeps || new Set()).has(d.id);
+    let color = '#8a93a6', marker = 'm-arr', dash = '';
+    if (hl) { color = '#f0a35e'; marker = 'm-arr-hl'; }
+    else if (violated) { color = '#e5484d'; marker = 'm-arr-red'; dash = ' stroke-dasharray="4 3"'; }
+    else if (resolved) { color = '#5ec49a'; marker = 'm-arr-green'; dash = ' stroke-dasharray="6 3"'; }
     const rel = { before: '先于', triggers: '触发', during: '包含' }[d.type] || d.type;
     P.push(`<path d="M${x1.toFixed(1)},${ca.y.toFixed(1)} C${(x1 + 36).toFixed(1)},${ca.y.toFixed(1)} ${(x2 - 36).toFixed(1)},${cb.y.toFixed(1)} ${x2.toFixed(1)},${cb.y.toFixed(1)}" ` +
       `fill="none" stroke="${color}" stroke-width="${hl ? 2.2 : 1.3}"${dash} marker-end="url(#${marker})"/>`);
@@ -318,9 +456,34 @@ function renderTimeline() {
     el.innerHTML = '<div class="empty-state">暂无事件 —— 在左侧录入,或点击「载入演示数据」</div>';
     return;
   }
-  el.innerHTML = buildTimelineSVG(S.events, S.deps, {
+  const calibrated = S.timeMode === 'calibrated' && S.cal && S.cal.live_fit;
+  const evs = calibrated ? calViewEvents() : S.events;
+  let conflicts = S.conflicts;
+  const resolvedDeps = new Set();
+  if (calibrated) {
+    conflicts = S.cal.calibrated_analysis.conflicts;
+    // 原始冲突依赖中, 校准后不再冲突的 = 被时钟校准消除
+    const calDepBad = new Set();
+    conflicts.forEach((c) => (c.dep_ids || []).forEach((i) => calDepBad.add(i)));
+    S.conflicts.forEach((c) => (c.dep_ids || []).forEach((i) => {
+      if (!calDepBad.has(i)) resolvedDeps.add(i);
+    }));
+  }
+  // 追溯校准点 -> 相关事件
+  const traceIds = new Set();
+  if (S.tracePointIds && S.cal) {
+    S.cal.points.filter((p) => S.tracePointIds.has(p.id)).forEach((p) => {
+      traceIds.add(p.a_event_id); traceIds.add(p.b_event_id);
+    });
+  }
+  const bandsById = {};
+  if (S.cal) Object.entries(S.cal.bands_ms).forEach(([k, v]) => { bandsById[k] = v; });
+  el.innerHTML = buildTimelineSVG(evs, S.deps, {
     interactive: true, view: S.view, width,
-    conflicts: S.conflicts, hlConflict: S.hlConflict, selectedId: S.selectedId,
+    conflicts, hlConflict: S.hlConflict, selectedId: S.selectedId,
+    mode: S.timeMode, rawEvents: S.events,
+    showBands: S.showBands, showGhost: S.showGhost, bandsById,
+    traceEventIds: traceIds, resolvedDeps,
   });
 }
 
@@ -342,6 +505,10 @@ function renderTimeline() {
 
   el.addEventListener('dblclick', (e) => {
     if (e.target.closest('.ev')) return;
+    if (S.timeMode === 'calibrated') {
+      toast('校准视图下时间由时钟参数推导, 请切回原始时间新建/改动事件', true);
+      return;
+    }
     const rect = el.getBoundingClientRect();
     const t = S.view.start + (e.clientX - rect.left + el.scrollLeft - LEFT) / S.view.pxPerMs;
     startEdit(null);
@@ -357,7 +524,9 @@ function renderTimeline() {
     const evG = e.target.closest('.ev');
     const rect = el.getBoundingClientRect();
     const startX = e.clientX - rect.left + el.scrollLeft;
+    const calibrated = S.timeMode === 'calibrated';
     if (handle) {
+      if (calibrated) return;
       const ev = evById(+handle.dataset.id);
       if (!ev || ev.locked) return;
       S.drag = { mode: handle.dataset.side === 'l' ? 'resize-l' : 'resize-r', id: ev.id,
@@ -368,7 +537,8 @@ function renderTimeline() {
     if (evG) {
       const ev = evById(+evG.dataset.id);
       if (!ev) return;
-      S.drag = { mode: ev.locked ? 'click' : 'move', id: ev.id, startX,
+      // 校准模式不允许拖动改写原始时间, 只做选中
+      S.drag = { mode: (ev.locked || calibrated) ? 'click' : 'move', id: ev.id, startX,
         origStart: ev.start_ts, origEnd: evEnd(ev), moved: false };
       e.preventDefault();
       return;
@@ -469,6 +639,15 @@ function startEdit(id) {
   form.color.value = ev.color || '#5b8def';
   form.evidence.value = ev.evidence || '';
   form.locked.checked = !!ev.locked;
+  form.clock_source_id.value = ev.clock_source_id == null ? '' : ev.clock_source_id;
+}
+
+function populateClockSourceSelects() {
+  const opts = '<option value="">— 不参与时钟校准 —</option>' +
+    (S.cal ? S.cal.sources.map((s) =>
+      `<option value="${s.id}">${esc(s.name)}${s.is_baseline ? ' ★基准' : ''}</option>`).join('') : '');
+  const sel = $('#event-clock-source');
+  if (sel) { const cur = sel.value; sel.innerHTML = opts; sel.value = cur; }
 }
 
 function selectEvent(id) {

@@ -44,9 +44,14 @@
           <label>分组<input name="group_name" placeholder="如: 数据库"></label>
         </div>
         <div class="row2">
-          <label>来源<input name="source" placeholder="如: slow-query.log"></label>
+          <label>来源(文本)<input name="source" placeholder="如: slow-query.log"></label>
           <label>颜色<input name="color" type="color" value="#5b8def"></label>
         </div>
+        <label>时钟来源
+          <select name="clock_source_id" id="event-clock-source">
+            <option value="">— 不参与时钟校准 —</option>
+          </select>
+        </label>
         <label>证据引用<textarea name="evidence" rows="2" placeholder="日志原文 / 链接 / 截图说明"></textarea></label>
         <label class="inline"><input name="locked" type="checkbox"> 锁定(不参与自动调整与拖动)</label>
         <div class="form-actions">
@@ -81,6 +86,12 @@
       <button class="btn sm" id="zoom-out">−</button>
       <button class="btn sm" id="zoom-in">＋</button>
       <button class="btn sm" id="zoom-fit">适应全部</button>
+      <div class="time-toggle" id="time-toggle">
+        <button class="seg active" data-mode="raw">原始时间</button>
+        <button class="seg" data-mode="calibrated">校准时间</button>
+      </div>
+      <label class="ck-sm"><input type="checkbox" id="show-bands" checked> 误差带</label>
+      <label class="ck-sm"><input type="checkbox" id="show-ghost" checked> 校准前位置</label>
       <label class="tz-label">显示时区
         <select id="display-tz">
           <option value="UTC">UTC</option>
@@ -90,7 +101,8 @@
           <option value="-08:00">UTC-8</option>
         </select>
       </label>
-      <span class="hint">滚轮缩放 · 拖动空白平移 · 拖动事件条移动/改时长 · 双击空白在该时刻新建事件</span>
+      <span class="hint" id="tl-hint">滚轮缩放 · 拖动空白平移 · 拖动事件条移动/改时长 · 双击空白在该时刻新建事件</span>
+      <span class="version-pill" id="version-pill" hidden></span>
     </div>
     <div id="timeline" class="timeline"></div>
   </main>
@@ -99,6 +111,7 @@
   <aside class="panel">
     <nav class="tabs">
       <button class="tab active" data-tab="conflicts">冲突 <span id="conflict-badge" class="badge-num">0</span></button>
+      <button class="tab" data-tab="clock">时钟校准 <span id="clock-badge" class="badge-num zero">0</span></button>
       <button class="tab" data-tab="plans">调整方案</button>
       <button class="tab" data-tab="deps">依赖与互斥</button>
       <button class="tab" data-tab="compare">版本对比</button>
@@ -107,6 +120,53 @@
     <div class="tab-page active" id="tab-conflicts">
       <div id="conflict-summary" class="muted"></div>
       <div id="conflict-list"></div>
+    </div>
+
+    <div class="tab-page" id="tab-clock">
+      <section class="card flat">
+        <h3>① 时钟来源与基准</h3>
+        <div class="row2">
+          <label>名称<input id="cs-name" placeholder="如: cache-node-7 日志机"></label>
+          <label class="inline vmiddle"><input type="checkbox" id="cs-baseline"> 设为基准时钟</label>
+        </div>
+        <label>说明<input id="cs-desc" placeholder="可选, 如 ntpd 故障 / 边缘网关"></label>
+        <button id="btn-add-source" class="btn">建立时钟来源</button>
+        <div id="source-list" class="source-list"></div>
+      </section>
+
+      <section class="card flat">
+        <h3>② 校准点(同一事实配对)</h3>
+        <p class="hint">把两个来源中代表同一事实的事件配成一组, 给出允许误差。至少两个跨时刻配点才能估漂移。</p>
+        <div class="row2">
+          <label>事件 A<select id="cp-a"></select></label>
+          <label>事件 B<select id="cp-b"></select></label>
+        </div>
+        <div class="row2">
+          <label>A 时钟来源<select id="cp-as"></select></label>
+          <label>B 时钟来源<select id="cp-bs"></select></label>
+        </div>
+        <div class="row2">
+          <label>允许误差(秒)<input id="cp-tol" type="number" value="2" step="0.1" min="0"></label>
+          <label>备注<input id="cp-note" placeholder="可选"></label>
+        </div>
+        <button id="btn-add-point" class="btn">添加校准点</button>
+        <div id="point-list" class="point-list"></div>
+      </section>
+
+      <section class="card flat">
+        <h3>③ 当前估计(候选方案)</h3>
+        <p class="hint">锁定可信来源或参数后重新生成, 比较冲突数、总修正量、最大残差; 选定后另存为校准版本。</p>
+        <button id="btn-candidates" class="btn primary">生成校准候选</button>
+        <div id="clock-issues"></div>
+        <div id="live-params"></div>
+        <div id="candidate-list"></div>
+      </section>
+
+      <section class="card flat">
+        <h3>④ 校准版本</h3>
+        <p class="hint">版本只保存校准参数, <b>不改写事件原始时间</b>。校准关系变化后旧版本标记为过期, 仍可切回对照。</p>
+        <div id="version-list"></div>
+      </section>
     </div>
 
     <div class="tab-page" id="tab-plans">
