@@ -620,13 +620,19 @@ window.addEventListener('resize', () => renderTimeline());
 // ---------------------------------------------------------------- 事件表单与列表
 
 function startEdit(id) {
+  populateClockSourceSelects();
   S.editingId = id;
   const form = $('#event-form');
   $('#form-title').textContent = id ? `编辑事件 #${id}` : '新增事件';
   $('#form-cancel').hidden = !id;
   $('#form-delete').hidden = !id;
   $('#form-submit').textContent = id ? '保存修改' : '保存事件';
-  if (!id) { form.reset(); form.timezone.value = S.displayTz; return; }
+  if (!id) {
+    form.reset();
+    form.timezone.value = S.displayTz;
+    form.clock_source_id.value = '';
+    return;
+  }
   const ev = evById(id);
   if (!ev) return;
   form.title.value = ev.title;
@@ -684,6 +690,7 @@ $('#event-form').onsubmit = async (e) => {
     color: form.color.value,
     evidence: form.evidence.value.trim(),
     locked: form.locked.checked,
+    clock_source_id: form.clock_source_id.value ? +form.clock_source_id.value : null,
   };
   try {
     if (S.editingId) {
@@ -761,17 +768,43 @@ function evidenceHtml(evidence) {
     </div>`).join('');
 }
 
+function conflictByIdentity(list, c) {
+  return list.find((k) =>
+    (c.dep_ids || []).slice().sort().join(',') === (k.dep_ids || []).slice().sort().join(',')
+    && (c.event_ids || []).slice().sort().join(',') === (k.event_ids || []).slice().sort().join(',')
+    && c.type === k.type);
+}
+
 function renderConflicts() {
   const sum = $('#conflict-summary');
-  if (!S.conflicts.length) {
-    sum.innerHTML = S.events.length ? '<span class="ok-text">✓ 未检测到冲突,时间线自洽</span>' : '';
-    $('#conflict-list').innerHTML = '';
+  const calibrated = S.timeMode === 'calibrated' && S.cal && S.cal.calibrated_analysis;
+  const list = calibrated ? S.cal.calibrated_analysis.conflicts : S.conflicts;
+  // 校准模式下, 标记每条冲突是否在校准后消失(被时钟校准解决)
+  const calIds = new Set();
+  if (calibrated) {
+    (S.cal.calibrated_analysis.conflicts || []).forEach((c) =>
+      (c.dep_ids || []).forEach((i) => calIds.add(i)));
+  }
+  if (!list.length) {
+    sum.innerHTML = calibrated
+      ? '<span class="ok-text">✓ 校准后这些时钟相关冲突已消除</span>'
+      : (S.events.length ? '<span class="ok-text">✓ 未检测到冲突,时间线自洽</span>' : '');
+    $('#conflict-list').innerHTML = calibrated && S.conflicts.length
+      ? S.conflicts.map((c) => resolvedCard(c)).join('') : '';
+    bindResolvedCards();
     return;
   }
   const byType = {};
-  S.conflicts.forEach((c) => { byType[c.type_label] = (byType[c.type_label] || 0) + 1; });
-  sum.innerHTML = Object.entries(byType).map(([k, v]) => `${k} × ${v}`).join(' · ');
-  $('#conflict-list').innerHTML = S.conflicts.map((c) => `
+  list.forEach((c) => { byType[c.type_label] = (byType[c.type_label] || 0) + 1; });
+  sum.innerHTML = (calibrated ? '校准时间 · ' : '')
+    + Object.entries(byType).map(([k, v]) => `${k} × ${v}`).join(' · ');
+  $('#conflict-list').innerHTML = list.map((c) => {
+    // 是否能追溯到校准点
+    const tps = tracePointsForConflict(c);
+    const traceBtn = tps.length
+      ? `<button class="btn sm" data-act="trace" data-points="${tps.join(',')}">追溯校准点 (#${tps.join(', #')})</button>`
+      : '';
+    return `
     <div class="conflict-card sev-${esc(c.severity)} ${S.hlConflict === c.id ? 'hl' : ''}" data-id="${esc(c.id)}">
       <div class="head"><span class="type-badge">${esc(c.type_label)}</span>
         <span class="sev-badge sev-${esc(c.severity)}">● ${esc(c.severity_label)}</span></div>
@@ -783,8 +816,10 @@ function renderConflicts() {
       ${evidenceHtml(c.evidence)}
       <div class="card-actions">
         <button class="btn sm" data-act="locate" data-id="${esc(c.id)}">在时间轴上定位</button>
+        ${traceBtn}
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   $('#conflict-list').querySelectorAll('.conflict-card').forEach((card) => {
     card.onclick = (e) => {
       if (e.target.dataset.act) return;
@@ -793,7 +828,7 @@ function renderConflicts() {
       renderConflicts();
     };
     card.querySelector('[data-act="locate"]').onclick = () => {
-      const c = S.conflicts.find((k) => k.id === card.dataset.id);
+      const c = list.find((k) => k.id === card.dataset.id);
       if (!c) return;
       S.hlConflict = c.id;
       const ts = [];
@@ -811,6 +846,62 @@ function renderConflicts() {
       }
       renderTimeline();
       renderConflicts();
+    };
+    card.querySelector('[data-act="trace"]')?.addEventListener('click', () => {
+      const ids = card.querySelector('[data-act="trace"]').dataset.points.split(',').map(Number);
+      tracePoints(ids);
+    });
+  });
+}
+
+// 与冲突事件相关的校准点
+function tracePointsForConflict(c) {
+  if (!S.cal) return [];
+  const evIds = new Set(c.event_ids || []);
+  return S.cal.points
+    .filter((p) => evIds.has(p.a_event_id) || evIds.has(p.b_event_id))
+    .map((p) => p.id);
+}
+
+function tracePoints(ids) {
+  S.tracePointIds = new Set(ids);
+  if (S.timeMode !== 'calibrated') {
+    S.timeMode = 'calibrated';
+    document.querySelectorAll('#time-toggle .seg').forEach((s) =>
+      s.classList.toggle('active', s.dataset.mode === 'calibrated'));
+  }
+  fitView();
+  renderTimeline();
+  toast(`已追溯 ${ids.length} 个校准点, 相关事件在时间轴上高亮`);
+}
+
+function resolvedCard(c) {
+  return `<div class="conflict-card sev-${esc(c.severity)}" style="opacity:.55;border-left-color:var(--green)">
+    <div class="head"><span class="type-badge">${esc(c.type_label)}</span>
+      <span style="color:var(--green)">✓ 校准后消除</span></div>
+    <h3>${esc(c.title)}</h3>
+    <div class="card-actions">
+      <button class="btn sm" data-act="locate-resolved" data-id="${esc(c.id)}">在时间轴上定位</button>
+    </div></div>`;
+}
+
+function bindResolvedCards() {
+  $('#conflict-list').querySelectorAll('[data-act="locate-resolved"]').forEach((btn) => {
+    btn.onclick = () => {
+      const c = S.conflicts.find((k) => k.id === btn.dataset.id);
+      if (!c) return;
+      const ts = [];
+      (c.chain || []).forEach((st) => {
+        if (st.kind === 'event' && st.start_ts != null) ts.push(st.start_ts);
+      });
+      if (ts.length) {
+        const t0 = Math.min(...ts), t1 = Math.max(...ts);
+        const span = Math.max(t1 - t0, 30000);
+        const plotW = timelineWidth() - LEFT - RIGHT;
+        S.view.pxPerMs = plotW / (span * 2.2);
+        S.view.start = t0 - span * 0.6;
+      }
+      renderTimeline();
     };
   });
 }
@@ -1044,6 +1135,342 @@ document.querySelectorAll('.tab').forEach((tab) => {
     $(`#tab-${tab.dataset.tab}`).classList.add('active');
   };
 });
+
+// ---------------------------------------------------------------- 时间模式 / 误差带
+
+document.querySelectorAll('#time-toggle .seg').forEach((seg) => {
+  seg.onclick = () => {
+    const mode = seg.dataset.mode;
+    if (mode === S.timeMode) return;
+    S.timeMode = mode;
+    document.querySelectorAll('#time-toggle .seg').forEach((s) => s.classList.toggle('active', s === seg));
+    if (mode === 'calibrated' && (!S.cal || !S.cal.live_fit)) {
+      toast('尚未估计出时钟参数, 请先在「时钟校准」页建立来源与配点', true);
+    }
+    fitView();
+    renderTimeline();
+  };
+});
+$('#show-bands').onchange = (e) => { S.showBands = e.target.checked; renderTimeline(); };
+$('#show-ghost').onchange = (e) => { S.showGhost = e.target.checked; renderTimeline(); };
+
+function renderVersionPill() {
+  const pill = $('#version-pill');
+  if (!pill) return;
+  const av = S.cal && S.cal.active_version;
+  if (!av) { pill.hidden = true; pill.textContent = ''; return; }
+  const stale = S.cal.active_version_stale;
+  pill.hidden = false;
+  pill.className = 'version-pill' + (stale ? ' stale' : '');
+  pill.textContent = (stale ? '⚠ 版本已过期: ' : '校准版本: ') +
+    (av.plan_name || '') + ` #${S.cal.active_version_id}`;
+}
+
+// ---------------------------------------------------------------- 时钟校准面板
+
+function srcName(id) {
+  if (!S.cal) return `#${id}`;
+  const s = S.cal.sources.find((x) => x.id === id);
+  return s ? s.name : `#${id}`;
+}
+
+function evTitle(id) {
+  const e = evById(id);
+  return e ? e.title : `#${id}`;
+}
+
+function renderClockPanel() {
+  if (!S.cal) return;
+  renderIssues();
+  renderSources();
+  renderPoints();
+  renderLiveParams();
+  renderCandidates();
+  renderVersions();
+}
+
+function renderIssues() {
+  const el = $('#clock-issues');
+  if (!el) return;
+  const issues = S.cal.issues || [];
+  const badPoints = (S.cal.point_diagnostics || []).filter((p) => p.status !== 'ok');
+  if (!issues.length && !badPoints.length) {
+    el.innerHTML = '<div class="ok-text" style="margin:8px 0">✓ 校准关系自洽</div>';
+    return;
+  }
+  let html = '<div class="issue-list">';
+  issues.forEach((i) => {
+    html += `<div class="issue ${esc(i.kind)}">${esc(i.message)}</div>`;
+  });
+  badPoints.forEach((p) => {
+    (p.messages || []).forEach((m) => {
+      html += `<div class="issue ${esc(p.status)}">校准点 #${p.id}: ${esc(m)}</div>`;
+    });
+  });
+  el.innerHTML = html + '</div>';
+}
+
+function renderSources() {
+  // 事件表单下拉
+  populateClockSourceSelects();
+  const el = $('#source-list');
+  if (!el) return;
+  if (!S.cal.sources.length) {
+    el.innerHTML = '<div class="empty-state">还没有时钟来源</div>';
+  } else {
+    const disc = new Set((S.cal.issues || [])
+      .filter((i) => i.kind === 'disconnected').map((i) => i.source_id));
+    el.innerHTML = S.cal.sources.map((s) => {
+      const locks = S.cal.locks || {};
+      const offVal = locks.offset && s.id in locks.offset ? locks.offset[s.id] : '';
+      const dftVal = locks.drift && s.id in locks.drift ? locks.drift[s.id] : '';
+      const srcLocked = (locks.sources || []).includes(s.id);
+      return `<div class="source-row" data-id="${s.id}">
+        <div class="top">
+          <span class="nm">${esc(s.name)}</span>
+          ${s.is_baseline ? '<span class="base-tag">★ 基准</span>'
+            : disc.has(s.id) ? '<span class="disc-tag">未连通</span>' : ''}
+          ${!s.is_baseline ? `<button class="link-btn" data-act="baseline" title="设为基准">设基准</button>` : ''}
+          ${!s.is_baseline ? `<button class="link-btn danger" data-act="del">删除</button>` : ''}
+        </div>
+        ${s.description ? `<div class="ds">${esc(s.description)}</div>` : ''}
+        ${!s.is_baseline ? `<div class="lock-grid">
+          <label class="ck"><input type="checkbox" data-lock="source" ${srcLocked ? 'checked' : ''}> 锁定来源</label>
+          <input type="number" step="any" placeholder="锁定偏移(ms)" data-lock="offset" value="${offVal === '' ? '' : Number(offVal).toFixed(0)}">
+          <input type="number" step="any" placeholder="锁定漂移(ms/时)" data-lock="drift" value="${dftVal === '' ? '' : Number(dftVal).toFixed(3)}">
+          <button class="btn sm" data-act="lock">应用</button>
+        </div>` : ''}
+      </div>`;
+    }).join('');
+
+    el.querySelectorAll('.source-row').forEach((row) => {
+      const sid = +row.dataset.id;
+      row.querySelector('[data-act="del"]')?.addEventListener('click', async () => {
+        if (!confirm('删除该时钟来源? 相关校准点将一并删除, 事件归属清空。')) return;
+        try { applyState(await api(`/api/clock_sources/${sid}`, 'DELETE')); toast('已删除来源'); }
+        catch (ex) { toast(ex.message, true); }
+      });
+      row.querySelector('[data-act="baseline"]')?.addEventListener('click', async () => {
+        try { applyState(await api(`/api/clock_sources/${sid}`, 'PUT', { is_baseline: true })); toast('已设为基准'); }
+        catch (ex) { toast(ex.message, true); }
+      });
+      row.querySelector('[data-act="lock"]')?.addEventListener('click', async () => {
+        const body = {
+          lock_source: row.querySelector('[data-lock="source"]').checked,
+          lock_offset_ms: row.querySelector('[data-lock="offset"]').value,
+          lock_drift_ms_per_hour: row.querySelector('[data-lock="drift"]').value,
+        };
+        try { applyState(await api(`/api/clock_sources/${sid}/locks`, 'POST', body)); toast('锁定已更新'); }
+        catch (ex) { toast(ex.message, true); }
+      });
+    });
+  }
+
+  // 校准点的来源下拉
+  const srcOpts = S.cal.sources.map((s) =>
+    `<option value="${s.id}">${esc(s.name)}</option>`).join('');
+  ['#cp-as', '#cp-bs'].forEach((sel) => {
+    const el2 = $(sel);
+    if (el2) el2.innerHTML = srcOpts;
+  });
+  // 事件下拉(显示当前归属)
+  const evOpts = S.events.map((e) => {
+    const src = e.clock_source_id == null ? '' : ` [${esc(srcName(e.clock_source_id))}]`;
+    return `<option value="${e.id}">#${e.id} ${esc(e.title)}${src}</option>`;
+  }).join('');
+  ['#cp-a', '#cp-b'].forEach((sel) => {
+    const el2 = $(sel);
+    if (el2) { const cur = el2.value; el2.innerHTML = evOpts; if (cur) el2.value = cur; }
+  });
+  // 选中事件时自动带出其归属来源
+  const syncSrc = (evSel, srcSel) => {
+    const e = evById(+evSel.value);
+    if (e && e.clock_source_id != null) srcSel.value = e.clock_source_id;
+  };
+  $('#cp-a').onchange = () => syncSrc($('#cp-a'), $('#cp-as'));
+  $('#cp-b').onchange = () => syncSrc($('#cp-b'), $('#cp-bs'));
+}
+
+$('#btn-add-source').onclick = async () => {
+  const name = $('#cs-name').value.trim();
+  if (!name) { toast('请填写来源名称', true); return; }
+  try {
+    applyState(await api('/api/clock_sources', 'POST', {
+      name, description: $('#cs-desc').value.trim(),
+      is_baseline: $('#cs-baseline').checked,
+    }));
+    $('#cs-name').value = ''; $('#cs-desc').value = ''; $('#cs-baseline').checked = false;
+    toast('时钟来源已建立');
+  } catch (ex) { toast(ex.message, true); }
+};
+
+function pointStatus(id) {
+  const d = (S.cal.point_diagnostics || []).find((x) => x.id === id);
+  return d ? d.status : 'ok';
+}
+
+const POINT_STATUS_LABEL = {
+  ok: '自洽', contradictory: '矛盾', same_source: '同来源',
+  duplicate: '重复', dangling: '悬空',
+};
+
+function renderPoints() {
+  const el = $('#point-list');
+  if (!el) return;
+  if (!S.cal.points.length) {
+    el.innerHTML = '<div class="empty-state">还没有校准点</div>';
+    return;
+  }
+  const res = (S.cal.live_fit ? S.cal.live_fit.residuals : {}) || {};
+  el.innerHTML = S.cal.points.map((p) => {
+    const st = pointStatus(p.id);
+    const r = res[String(p.id)];
+    return `<div class="point-row ${st === 'contradictory' ? 'bad' : ''}" data-id="${p.id}">
+      <div class="pair">
+        <span class="pa">${esc(evTitle(p.a_event_id))}</span>
+        <span class="rel">≡</span>
+        <span class="pb">${esc(evTitle(p.b_event_id))}</span>
+        <span class="status-dot st-${st}">${POINT_STATUS_LABEL[st] || st}</span>
+        <button class="link-btn danger" data-act="del" style="margin-left:auto">删除</button>
+      </div>
+      <div class="meta">
+        <span>${esc(srcName(p.a_source_id))} ↔ ${esc(srcName(p.b_source_id))}</span>
+        <span>允许 ±${esc(fmtDur(p.tolerance_ms))}</span>
+        ${r != null ? `<span class="resid">残差 ${r > 0 ? '+' : ''}${esc(fmtDur(Math.abs(r)))}</span>` : ''}
+        ${p.note ? `<span>${esc(p.note)}</span>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.point-row').forEach((row) => {
+    const pid = +row.dataset.id;
+    row.querySelector('[data-act="del"]').onclick = async () => {
+      try { applyState(await api(`/api/calibration_points/${pid}`, 'DELETE')); toast('校准点已删除'); }
+      catch (ex) { toast(ex.message, true); }
+    };
+    // 点击校准点 -> 时间轴追溯
+    row.onclick = (e) => {
+      if (e.target.closest('button')) return;
+      tracePoint(pid);
+    };
+  });
+}
+
+$('#btn-add-point').onclick = async () => {
+  const body = {
+    a_event_id: +$('#cp-a').value,
+    b_event_id: +$('#cp-b').value,
+    a_source_id: +$('#cp-as').value,
+    b_source_id: +$('#cp-bs').value,
+    tolerance_ms: Math.round((+$('#cp-tol').value || 0) * 1000),
+    note: $('#cp-note').value.trim(),
+  };
+  if (!body.a_event_id || !body.b_event_id) { toast('请选择两个事件', true); return; }
+  if (!body.a_source_id || !body.b_source_id) { toast('请先建立并选择两个时钟来源', true); return; }
+  try {
+    applyState(await api('/api/calibration_points', 'POST', body));
+    $('#cp-note').value = '';
+    toast('校准点已添加');
+  } catch (ex) { toast(ex.message, true); }
+};
+
+function renderLiveParams() {
+  const el = $('#live-params');
+  if (!el) return;
+  if (!S.cal.live_fit) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="live-params">' + S.cal.live_fit.params.map((p) => {
+    const lock = [];
+    if (p.locked_offset) lock.push('偏移已锁');
+    if (p.locked_drift) lock.push('漂移已锁');
+    return `<div class="lp-row">
+      <span>${esc(p.source_name)}${p.is_baseline ? ' ★' : ''}</span>
+      <span class="v">${p.is_baseline ? '基准(0)'
+        : `修正 ${p.correction_ms > 0 ? '+' : ''}${fmtDur(Math.abs(p.correction_ms))} · 漂移 ${p.drift_sec_per_day > 0 ? '+' : ''}${p.drift_sec_per_day} 秒/天`}</span>
+      ${lock.length ? `<span class="muted">${lock.join('、')}</span>` : ''}
+    </div>`;
+  }).join('') + '</div>';
+}
+
+$('#btn-candidates').onclick = async () => {
+  try {
+    const data = await api('/api/calibration/candidates', 'POST', {});
+    S.candidates = data.plans;
+    renderCandidates();
+  } catch (ex) { toast(ex.message, true); }
+};
+
+function renderCandidates() {
+  const el = $('#candidate-list');
+  if (!el) return;
+  if (!S.candidates) { el.innerHTML = ''; return; }
+  el.innerHTML = S.candidates.map((p) => {
+    const params = p.fit.params.filter((q) => !q.is_baseline).map((q) =>
+      `<div>${esc(q.source_name)}: 修正 ${q.correction_ms > 0 ? '+' : '−'}${fmtDur(Math.abs(q.correction_ms))}`
+      + ` · 漂移 ${q.drift_sec_per_day > 0 ? '+' : '−'}${Math.abs(q.drift_sec_per_day)} 秒/天`
+      + `${q.locked_offset ? ' 🔒偏移' : ''}${q.locked_drift ? ' 🔒漂移' : ''}</div>`).join('');
+    const contr = (p.contradictory_point_ids || []).length;
+    return `<div class="cand-card" data-key="${esc(p.key)}">
+      <h4>${esc(p.name)}</h4>
+      <div class="muted">${esc(p.description)}</div>
+      <div class="cand-metrics">
+        <span>依赖冲突 <b>${p.conflict_count}</b></span>
+        <span>总修正量 <b>${esc(fmtDur(p.total_correction_ms))}</b></span>
+        <span>最大残差 <b>${esc(fmtDur(p.max_residual_ms))}</b></span>
+        ${contr ? `<span style="color:var(--red)">矛盾点 ${contr}</span>` : ''}
+        ${(p.dropped_point_ids || []).length ? `<span style="color:var(--orange)">剔除点 ${p.dropped_point_ids.join(',')}</span>` : ''}
+      </div>
+      <div class="cand-params">${params}</div>
+      <button class="btn primary block" data-act="save">另存为校准版本</button>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.cand-card').forEach((card) => {
+    card.querySelector('[data-act="save"]').onclick = async () => {
+      const key = card.dataset.key;
+      const label = prompt('版本名称:', `校准版本 ${new Date().toLocaleString()}`);
+      if (label === null) return;
+      try {
+        applyState(await api('/api/calibration/versions', 'POST', { plan_key: key, label }));
+        S.candidates = null;
+        renderCandidates();
+        toast('已另存为校准版本(事件原始时间未改动)');
+      } catch (ex) { toast(ex.message, true); }
+    };
+  });
+}
+
+function renderVersions() {
+  const el = $('#version-list');
+  if (!el) return;
+  const vs = S.cal.versions || [];
+  if (!vs.length) { el.innerHTML = '<div class="empty-state">还没有校准版本</div>'; return; }
+  el.innerHTML = vs.map((v) => {
+    const when = new Date(v.created_at * 1000).toLocaleString();
+    return `<div class="ver-row ${v.active ? 'active' : ''}" data-id="${v.id}">
+      <span class="vlabel">${esc(v.label)}<div class="vtime">${when}</div></span>
+      ${v.active ? '<span class="active-tag">使用中</span>' : ''}
+      ${v.stale ? '<span class="stale-tag">已过期</span>' : ''}
+      ${!v.active ? '<button class="link-btn" data-act="activate">切回此版本</button>' : ''}
+      <button class="link-btn danger" data-act="del">删除</button>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.ver-row').forEach((row) => {
+    const vid = +row.dataset.id;
+    row.querySelector('[data-act="activate"]')?.addEventListener('click', async () => {
+      try { applyState(await api(`/api/calibration/versions/${vid}/activate`, 'POST')); toast('已切换到该版本参数'); }
+      catch (ex) { toast(ex.message, true); }
+    });
+    row.querySelector('[data-act="del"]').addEventListener('click', async () => {
+      try { applyState(await api(`/api/calibration/versions/${vid}`, 'DELETE')); toast('版本已删除'); }
+      catch (ex) { toast(ex.message, true); }
+    });
+  });
+}
+
+// 异常追溯: tracePoints() 在冲突面板中定义, 这里提供单个校准点的入口
+function tracePoint(pid) {
+  tracePoints([pid]);
+  const p = S.cal.points.find((x) => x.id === pid);
+  if (p) toast(`校准点 #${pid}: ${evTitle(p.a_event_id)} ≡ ${evTitle(p.b_event_id)}`);
+}
 
 // ---------------------------------------------------------------- 启动
 

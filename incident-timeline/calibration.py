@@ -240,16 +240,20 @@ def fit(sources, points, events, locks, weights=None):
             _, di = idx[sid]
             C_rows.append({di: 1.0}); c_rhs.append(float(val))
     for sid, val in locked_off.items():
-        if sid in idx and sid not in locked_src and sid not in locked_dft:
+        # 即使漂移也被锁定, 仍要加入该行: 消元后 c = v_off + d·t0/U,
+        # 两个锁定值必须同时参与计算
+        if sid in idx and sid not in locked_src:
             ci, di = idx[sid]
             C_rows.append({ci: 1.0, di: -t0 / TIME_UNIT_MS}); c_rhs.append(float(val))
 
-    # 用约束消元: 把每个被锁定的参数变量表达为自由变量的仿射函数
+    # 用约束消元: 先按约束行逐个选主元, 再做一次完整前向代入, 把每个被
+    # 锁定的变量统一表示为自由变量的仿射函数
     # elim[var] = (const, {free_var: coef}), 即 p_var = const + Σ coef·p_f
     Cwork = [dict(r) for r in C_rows]
     cwork = list(c_rhs)
     used = [False] * len(Cwork)
-    elim = {}
+    # (变量列 -> (约束行号, 主元系数, 该行其余系数)), 选主元
+    pivot_of = {}
     for col in range(npar):
         cand = [i for i in range(len(Cwork))
                 if not used[i] and abs(Cwork[i].get(col, 0)) > 1e-12]
@@ -257,34 +261,53 @@ def fit(sources, points, events, locks, weights=None):
             continue
         i = max(cand, key=lambda r: abs(Cwork[r].get(col, 0)))
         used[i] = True
-        row, piv = Cwork[i], Cwork[i][col]
-        const_acc = cwork[i] / piv
-        terms = {k: -v / piv for k, v in row.items()
-                 if k != col and abs(v) > 1e-15}
-        # 展开此前已消元的变量(锁定行只有一列, 正常不会出现, 保留以保证一般性)
-        changed, guard = True, 0
-        while changed and guard < npar + 2:
-            changed = False
-            guard += 1
-            for ev_var, (ec, eterms) in list(elim.items()):
-                if ev_var in terms:
-                    f = terms.pop(ev_var)
-                    const_acc += f * ec
-                    for k2, v2 in eterms.items():
-                        terms[k2] = terms.get(k2, 0) + f * v2
-                    changed = True
-        elim[col] = (const_acc, terms)
-        # 从其余约束行中消去该列
+        piv = Cwork[i][col]
+        pivot_of[col] = (i, piv)
         for j in range(len(Cwork)):
-            if used[j]:
+            if used[j] or j == i:
                 continue
             f = Cwork[j].pop(col, 0)
             if f == 0:
                 continue
-            cwork[j] -= f * const_acc
-            for k2, v2 in terms.items():
-                Cwork[j][k2] = Cwork[j].get(k2, 0) - f * v2
-    # 未消费的约束行只可能是冗余(锁定行均为单变量, 不会真正矛盾)
+            cwork[j] -= f * (cwork[i] / piv)
+            for k2, v2 in Cwork[i].items():
+                if k2 == col:
+                    continue
+                Cwork[j][k2] = Cwork[j].get(k2, 0) - f * v2 / piv
+    # 未消费的约束行此时只应含 0=常数: 检测矛盾/冗余
+    for j in range(len(Cwork)):
+        if used[j]:
+            continue
+        coefs = {k: v for k, v in Cwork[j].items() if abs(v) > 1e-12}
+        if not coefs and abs(cwork[j]) > 1e-6:
+            raise LinAlgError(f'锁定参数相互矛盾(残差 {cwork[j]:g}ms)')
+
+    def resolve(col, seen=()):
+        """把某主元列表达为 (const, {free_var: coef}), 递归展开。"""
+        if col in elim_cache:
+            return elim_cache[col]
+        if col not in pivot_of:
+            return (0.0, {col: 1.0})      # 自由变量
+        if col in seen:
+            raise LinAlgError('锁定约束构成循环')
+        i, piv = pivot_of[col]
+        const = cwork[i] / piv
+        terms = defaultdict(float)
+        for k, v in Cwork[i].items():
+            if k == col or abs(v) <= 1e-15:
+                continue
+            ec, et = resolve(k, seen + (col,))
+            f = -v / piv
+            const += f * ec
+            for fk, fv in et.items():
+                terms[fk] += f * fv
+        elim_cache[col] = (const, dict(terms))
+        return elim_cache[col]
+
+    elim_cache = {}
+    elim = {}
+    for col in pivot_of:
+        elim[col] = resolve(col)
 
     free_cols = [c for c in range(npar) if c not in elim]
 

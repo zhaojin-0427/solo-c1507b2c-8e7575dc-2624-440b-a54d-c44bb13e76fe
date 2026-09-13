@@ -177,12 +177,13 @@ def restore_snapshot(snap):
     for e in snap['events']:
         db.execute(
             'INSERT INTO events(id,title,description,start_ts,end_ts,timezone,confidence,'
-            'source,evidence,locked,group_name,color,created_at) '
-            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            'source,evidence,locked,group_name,color,clock_source_id,created_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (e['id'], e['title'], e.get('description', ''), e['start_ts'], e.get('end_ts'),
              e.get('timezone', 'UTC'), e.get('confidence', 'medium'), e.get('source', ''),
              e.get('evidence', ''), e.get('locked', 0), e.get('group_name', ''),
-             e.get('color', ''), e.get('created_at', int(time.time()))))
+             e.get('color', ''), e.get('clock_source_id'),
+             e.get('created_at', int(time.time()))))
     for d in snap['dependencies']:
         db.execute('INSERT INTO dependencies(id,type,from_id,to_id,min_gap_ms,max_gap_ms,note) '
                    'VALUES (?,?,?,?,?,?,?)',
@@ -242,10 +243,11 @@ def _calibration_state():
     active_detail = json.loads(active['detail']) if active else None
     stale = bool(active and active.get('signature') != sig)
 
-    # 校准视图优先采用激活版本参数; 版本过期(校准关系已变化)时回退 live,
-    # 版本摘要仍保留用于对照, 并明确提示过期。
+    # 校准视图采用激活版本参数。历史版本即使已过期(校准关系后来被改动),
+    # 重新激活后仍应完整恢复其保存参数用于对照, 不套用实时拟合;
+    # 过期只通过 stale 标记提示, 不改变所显示的参数。
     version_fit = None
-    if active_detail and not stale:
+    if active_detail:
         version_fit = {
             'params': {p['source_id']: {
                 'correction_ms': p['correction_ms'],
@@ -427,6 +429,19 @@ def update_event(eid):
         return err(str(ex))
     if not f:
         return jsonify(state_json())
+    # 变更时钟归属时, 若该事件已在校准点中, 拒绝以避免配点静默错位
+    if 'clock_source_id' in f and f['clock_source_id'] != row['clock_source_id']:
+        pts = db.execute(
+            'SELECT id FROM calibration_points WHERE a_event_id=? OR b_event_id=?',
+            (eid, eid)).fetchall()
+        if pts:
+            ids = ', '.join(f'#{p["id"]}' for p in pts)
+            return err(f'该事件已用于校准点 {ids}, 请先删除或修改相关校准点, 再改归属')
+        if f['clock_source_id'] is not None:
+            ok = db.execute('SELECT 1 FROM clock_sources WHERE id=?',
+                            (f['clock_source_id'],)).fetchone()
+            if not ok:
+                return err('所选时钟来源不存在')
     # 拖动等高频操作也入撤销栈, 标签区分
     label = '拖动事件' if set(f) <= {'start_ts', 'end_ts'} else '编辑事件'
     push_snapshot(label)
@@ -774,16 +789,33 @@ def create_calibration_point():
     if a_eid == b_eid:
         return err('校准点需要两个不同的事件')
     db = get_db()
-    n = db.execute('SELECT COUNT(*) c FROM events WHERE id IN (?,?)',
-                   (a_eid, b_eid)).fetchone()['c']
-    if n < 2:
-        return err('引用了不存在的事件')
     s = db.execute('SELECT COUNT(*) c FROM clock_sources WHERE id IN (?,?)',
                    (a_sid, b_sid)).fetchone()['c']
     if s < 2:
         return err('引用了不存在的时钟来源')
     if a_sid == b_sid:
         return err('两个事件应来自不同时钟来源')
+    ea = db.execute('SELECT title, clock_source_id FROM events WHERE id=?',
+                    (a_eid,)).fetchone()
+    eb = db.execute('SELECT title, clock_source_id FROM events WHERE id=?',
+                    (b_eid,)).fetchone()
+    if not ea or not eb:
+        return err('引用了不存在的事件')
+    # 提交的来源必须与事件的实际时钟归属一致, 否则拒绝保存
+    if ea['clock_source_id'] is None:
+        return err(f'事件「{ea["title"]}」尚未指定时钟来源, 请先在事件表单中归属')
+    if eb['clock_source_id'] is None:
+        return err(f'事件「{eb["title"]}」尚未指定时钟来源, 请先在事件表单中归属')
+    if ea['clock_source_id'] != a_sid:
+        src = db.execute('SELECT name FROM clock_sources WHERE id=?',
+                         (ea['clock_source_id'],)).fetchone()
+        return err(f'事件「{ea["title"]}」实际归属来源「{src["name"] if src else a_sid}」, '
+                   '与提交的来源不一致, 请改用其真实归属')
+    if eb['clock_source_id'] != b_sid:
+        src = db.execute('SELECT name FROM clock_sources WHERE id=?',
+                         (eb['clock_source_id'],)).fetchone()
+        return err(f'事件「{eb["title"]}」实际归属来源「{src["name"] if src else b_sid}」, '
+                   '与提交的来源不一致, 请改用其真实归属')
     dup = db.execute(
         'SELECT id FROM calibration_points WHERE '
         '((a_event_id=? AND b_event_id=?) OR (a_event_id=? AND b_event_id=?)) LIMIT 1',
